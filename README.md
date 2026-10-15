@@ -2,7 +2,6 @@
 
 ## ToDo
 - [ ] https://github.com/lautarovculic/ioscpy/issues/7
-- [ ] Screen Recording (showing status) button in sidepanel.
 - [ ] Research: Providing support for Windows with a GUI as well, installer (Reserved, Author will implement this fully)
 - [ ] Add Authentication & Authorization, also a notifiation in device that `ioscpy` is running (Reserved, Author will implement this fully)
 - [ ] Make `ioscpy` wireless (BLE, Wi-Fi) (Reserved, Author will implement this fully)
