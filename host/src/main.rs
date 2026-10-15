@@ -17,6 +17,7 @@ mod logging;
 mod mouse;
 mod platform;
 mod protocol;
+mod record;
 mod sidebar;
 mod update;
 mod usbmux;
@@ -26,6 +27,7 @@ mod wayland_compat;
 mod window;
 
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -180,6 +182,9 @@ fn run_connection_loop(
     clip_in: Option<mpsc::Sender<String>>,
 ) -> Result<()> {
     let mut first = true;
+    // Counts the files a single `--record` run has written, so a reconnect picks
+    // up in a new file instead of overwriting the one the dropped session left.
+    let mut record_session = 0usize;
     while !stop.load(Ordering::Relaxed) {
         // The forward has to outlive the session, so keep it in scope here.
         let mut forward: Option<usbmux::UsbForward> = None;
@@ -230,6 +235,24 @@ fn run_connection_loop(
         if frame_sink.is_some() && ack.capabilities.stream_backends.is_empty() {
             warn!("the phone side isn't fully up yet, so the screen might not show. Respring the phone (or reinstall ioscpy from Sileo) and reconnect.");
         }
+
+        // Recording needs the H.264 stream: the MP4 track is that stream muxed
+        // as-is, and no player takes the MJPEG fallback inside an MP4. So
+        // `--record` overrides `--mjpeg` and requires the device to offer H.264.
+        let record_path = cli
+            .record
+            .as_ref()
+            .map(|base| recording_path(Path::new(base), record_session));
+        if record_path.is_some() {
+            record_session += 1;
+        }
+        let have_h264 = ack.capabilities.stream_backends.iter().any(|b| b == "h264");
+        if record_path.is_some() && !have_h264 {
+            bail!("--record needs the device's H.264 stream, but this daemon only offers MJPEG");
+        }
+        if record_path.is_some() && cli.mjpeg && first {
+            warn!("--mjpeg is ignored while recording: an MP4 track needs the H.264 stream");
+        }
         first = false;
 
         if cli.handshake_only {
@@ -244,7 +267,7 @@ fn run_connection_loop(
 
         // Use H.264 when the device offers it and the user didn't force MJPEG.
         // The daemon also falls back to MJPEG if it can't honor the request.
-        let codec = if !cli.mjpeg && ack.capabilities.stream_backends.iter().any(|b| b == "h264") {
+        let codec = if have_h264 && (!cli.mjpeg || record_path.is_some()) {
             protocol::VIDEO_CODEC_H264
         } else {
             protocol::VIDEO_CODEC_MJPEG
@@ -261,6 +284,7 @@ fn run_connection_loop(
             clip_in.as_ref(),
             codec,
             suppress_keyboard,
+            record_path,
         )? {
             health::SessionEnd::Quit => break,
             health::SessionEnd::Lost => {
@@ -273,6 +297,24 @@ fn run_connection_loop(
     }
 
     Ok(())
+}
+
+/// Where the given recording session writes. The first session uses the path the
+/// user asked for; later ones (after a reconnect) get a `-2`, `-3`, … suffix so
+/// a dropped link can't clobber video that is already on disk.
+fn recording_path(base: &Path, session: usize) -> PathBuf {
+    if session == 0 {
+        return base.to_path_buf();
+    }
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ioscpy".to_string());
+    let name = match base.extension().map(|e| e.to_string_lossy().into_owned()) {
+        Some(ext) => format!("{stem}-{}.{ext}", session + 1),
+        None => format!("{stem}-{}", session + 1),
+    };
+    base.with_file_name(name)
 }
 
 /// Connect, stream, save the first frame's JPEG to `path`, then exit.

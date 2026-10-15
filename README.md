@@ -45,9 +45,25 @@ ioscpy --device <UDID>   # pick a device when several are attached
 ioscpy --list            # list attached devices
 ioscpy --no-keyboard     # hide the on-screen keyboard, type from the Mac
 ioscpy --mjpeg           # force MJPEG video instead of the default H.264
+ioscpy --record out.mp4  # record the mirrored screen while mirroring (video only)
 ioscpy --debug           # full diagnostics
 ioscpy --version
 ```
+
+## Recording
+
+`--record PATH` writes what is on the mirrored screen to an MP4 while the session
+runs. The H.264 stream the phone already sends is muxed straight into the file, so
+nothing is re-encoded and recording costs a buffered write per frame; the window
+stays as responsive as it was. The stream carries no audio, so recordings are
+silent. A reconnect starts a new file (`out-2.mp4`, `out-3.mp4`, …) instead of
+overwriting the one the dropped session wrote.
+
+The track starts at the first keyframe after the session starts, and the file is
+finalized when the window closes. Recording follows the stream's own orientation,
+so a session captured with the phone held in landscape is stored rotated;
+QuickTime's rotate, or one `ffmpeg -display_rotation 90 -i out.mp4 -c copy` pass,
+fixes that up without re-encoding either.
 
 ## Linux
 

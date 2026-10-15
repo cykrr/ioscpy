@@ -30,6 +30,13 @@ pub struct Cli {
     #[arg(long)]
     pub mjpeg: bool,
 
+    /// Record the mirrored screen to this MP4 file. The H.264 stream is muxed as
+    /// it arrives, so there is no re-encode and no visible cost while mirroring.
+    /// Video only (the device sends no audio); a reconnect continues in
+    /// `name-2.mp4`, `name-3.mp4`, … rather than overwriting.
+    #[arg(long, value_name = "PATH")]
+    pub record: Option<String>,
+
     /// Stay on native Wayland even when the compositor draws no window
     /// decorations for us (GNOME/mutter). By default ioscpy falls back to
     /// X11/XWayland there so the window gets a titlebar.

@@ -2,6 +2,7 @@
 //! that keeps the control channel alive and surfaces what the daemon sends.
 
 use std::net::{Shutdown, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use anyhow::{Context, Result};
 use crate::h264::{Decoded, H264Decoder};
 use crate::input::InputFrame;
 use crate::protocol::{self, Capabilities, HelloAck, LogMessage, MessageType, CHANNEL_CONTROL};
+use crate::record::Recorder;
 use crate::video;
 use crate::window::FrameSlot;
 
@@ -68,6 +70,7 @@ pub fn run_session(
     clip_in: Option<&Sender<String>>,
     codec: u8,
     suppress_keyboard: bool,
+    record: Option<PathBuf>,
 ) -> Result<SessionEnd> {
     stream.set_read_timeout(None).ok();
     let mut writer = stream.try_clone().context("clone control stream")?;
@@ -105,6 +108,13 @@ pub fn run_session(
     // ask the device for a fresh keyframe.
     let want_keyframe = Arc::new(AtomicBool::new(false));
 
+    // Opened before the session so a bad path fails now rather than at the first
+    // keyframe; the MP4 itself is started inside the reader thread.
+    let recorder = match record {
+        Some(path) => Some(Recorder::new(&path)?),
+        None => None,
+    };
+
     let (tx, rx) = mpsc::channel::<Incoming>();
     let sink = frame_sink.clone();
     let reader_count = video_count.clone();
@@ -114,14 +124,26 @@ pub fn run_session(
         // keep latest and decode later). The decoder is built on the first H.264
         // frame, which carries SPS/PPS. JPEG stays stateless.
         let mut h264: Option<H264Decoder> = None;
+        let mut recorder = recorder;
         loop {
             match protocol::read_frame(&mut reader) {
                 Ok(frame) => {
                     if frame.message_type() == Some(MessageType::VideoFrame) {
-                        if let Some(slot) = &sink {
-                            if let Some((_, _, flags, data)) =
-                                protocol::parse_video_payload(&frame.payload)
-                            {
+                        if let Some((width, height, flags, data)) =
+                            protocol::parse_video_payload(&frame.payload)
+                        {
+                            // Recording needs every frame in order, so it happens
+                            // here rather than on the window thread, which only
+                            // ever sees the newest one.
+                            if let Some(rec) = recorder.as_mut() {
+                                if let Err(e) = rec.push(width, height, flags, data) {
+                                    crate::warn!("recording stopped: {e:#}");
+                                    // Dropping the recorder closes the file, so
+                                    // what was captured so far stays playable.
+                                    recorder = None;
+                                }
+                            }
+                            if let Some(slot) = &sink {
                                 let decoded = if flags & protocol::VIDEO_FLAG_H264 != 0 {
                                     if h264.is_none() {
                                         h264 = H264Decoder::new();
@@ -161,6 +183,13 @@ pub fn run_session(
                     let _ = tx.send(Incoming::Disconnected);
                     break;
                 }
+            }
+        }
+        // The reader is joined before the session returns, so the recording is
+        // closed here and the file is complete by the time the window goes away.
+        if let Some(mut rec) = recorder {
+            if let Err(e) = rec.finish() {
+                crate::warn!("could not finalize the recording: {e:#}");
             }
         }
     });
