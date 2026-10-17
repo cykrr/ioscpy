@@ -513,33 +513,36 @@ struct XSample {
     wx: u32,
 }
 
-/// Bilinear blend of four `0x00RRGGBB` pixels using fixed-point integer math (0..=256 weights).
+/// Bilinear blend of four `0x00RRGGBB` pixels using fixed-point integer math with
+/// independent color channels to prevent channel crosstalk or overflow.
 #[inline(always)]
-fn bilerp_fast(p00: u32, p10: u32, p01: u32, p11: u32, wx: u32, wy: u32) -> u32 {
+fn bilerp(p00: u32, p10: u32, p01: u32, p11: u32, wx: u32, wy: u32) -> u32 {
     let inv_wx = 256 - wx;
     let inv_wy = 256 - wy;
+    let w00 = inv_wx * inv_wy;
+    let w10 = wx * inv_wy;
+    let w01 = inv_wx * wy;
+    let w11 = wx * wy;
 
-    // RB channels (mask 0x00FF00FF)
-    let rb00 = p00 & 0x00FF00FF;
-    let rb10 = p10 & 0x00FF00FF;
-    let rb01 = p01 & 0x00FF00FF;
-    let rb11 = p11 & 0x00FF00FF;
+    let r00 = (p00 >> 16) & 0xFF;
+    let r10 = (p10 >> 16) & 0xFF;
+    let r01 = (p01 >> 16) & 0xFF;
+    let r11 = (p11 >> 16) & 0xFF;
+    let r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) >> 16;
 
-    // G channel (mask 0x0000FF00)
     let g00 = (p00 >> 8) & 0xFF;
     let g10 = (p10 >> 8) & 0xFF;
     let g01 = (p01 >> 8) & 0xFF;
     let g11 = (p11 >> 8) & 0xFF;
+    let g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) >> 16;
 
-    let rb_top = rb00 * inv_wx + rb10 * wx;
-    let rb_bot = rb01 * inv_wx + rb11 * wx;
-    let rb = ((rb_top >> 8) * inv_wy + (rb_bot >> 8) * wy) >> 8;
+    let b00 = p00 & 0xFF;
+    let b10 = p10 & 0xFF;
+    let b01 = p01 & 0xFF;
+    let b11 = p11 & 0xFF;
+    let b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) >> 16;
 
-    let g_top = g00 * inv_wx + g10 * wx;
-    let g_bot = g01 * inv_wx + g11 * wx;
-    let g = ((g_top >> 8) * inv_wy + (g_bot >> 8) * wy) >> 8;
-
-    (rb & 0x00FF00FF) | ((g & 0xFF) << 8)
+    (r << 16) | (g << 8) | b
 }
 
 /// Bilinearly scale `src` into the `[0, content_w)` columns of `dst`, a
@@ -594,7 +597,7 @@ fn scale_frame(src: &DecodedFrame, content_w: usize, out_h: usize, stride: usize
         let srow1 = y1 * src.width;
         let drow = (y + y_off) * stride + x_off;
         for (x, sample) in x_lut.iter().enumerate() {
-            dst[drow + x] = bilerp_fast(
+            dst[drow + x] = bilerp(
                 src.buf[srow0 + sample.x0],
                 src.buf[srow0 + sample.x1],
                 src.buf[srow1 + sample.x0],
