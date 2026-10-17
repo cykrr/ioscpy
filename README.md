@@ -45,6 +45,7 @@ ioscpy --list            # list attached devices
 ioscpy --no-keyboard     # hide the on-screen keyboard, type from the Mac
 ioscpy --mjpeg           # force MJPEG video instead of the default H.264
 ioscpy --record out.mp4  # record the mirrored screen while mirroring (video only)
+ioscpy --print-fps       # show live FPS counter and dropped frames in window title and console
 ioscpy --debug           # full diagnostics
 ioscpy --version
 ```
@@ -210,6 +211,7 @@ build, confirm `nasm` is on `PATH`.
   and emoji go through the clipboard.
 - Esc: go back.
 - Cmd+J, Cmd+L, Cmd+T, Cmd+R: Home, Lock, App Switcher, Rotate.
+- Cmd+I: Toggle FPS counter on/off in console and window title bar.
 - Cmd+A, Cmd+C, Cmd+V, Cmd+X, Cmd+Z: Select All, Copy, Paste, Cut, Undo. The
   clipboard syncs both ways, so Cmd+C on the phone reaches the Mac.
 - Enter, Backspace, Tab, arrows: the matching editing keys.

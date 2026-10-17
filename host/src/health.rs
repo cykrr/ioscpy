@@ -165,11 +165,15 @@ pub fn run_session(
                                 };
                                 if let Some(f) = decoded {
                                     // Capture is always portrait, so rotate it
-                                    // upright per the device's reported orientation.
                                     let turns =
                                         video::upright_turns(protocol::video_orientation(flags));
                                     let f = video::rotate_cw(f, turns);
-                                    *slot.lock().unwrap() = Some(f);
+                                    let mut lock = slot.lock().unwrap();
+                                    if lock.frame.is_some() {
+                                        lock.dropped += 1;
+                                    }
+                                    lock.frame = Some(f);
+                                    lock.incoming += 1;
                                 }
                             }
                         }

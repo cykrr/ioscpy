@@ -50,6 +50,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_keyboard: bool,
 
+    /// Start FPS counter to report frame rate and dropped frames in the console
+    /// and window title. Can also be toggled interactively with Ctrl+i (Cmd+i on macOS).
+    #[arg(long)]
+    pub print_fps: bool,
+
     // hidden options for debugging, not part of normal use
     /// Connect directly to host:port, bypassing usbmux/iproxy (debugging only).
     #[arg(long, value_name = "ADDR", hide = true)]

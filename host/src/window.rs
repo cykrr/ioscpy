@@ -19,11 +19,18 @@ use crate::protocol::{self, KeyCode, MessageType, SystemAction, TouchPhase};
 use crate::sidebar;
 use crate::video::DecodedFrame;
 
-/// Where the network thread drops the most recent decoded frame (latest only).
-pub type FrameSlot = Arc<Mutex<Option<DecodedFrame>>>;
+/// Where the network thread drops the most recent decoded frame, alongside frame tracking stats.
+#[derive(Default)]
+pub struct FrameSlotInner {
+    pub frame: Option<DecodedFrame>,
+    pub incoming: u64,
+    pub dropped: u64,
+}
+
+pub type FrameSlot = Arc<Mutex<FrameSlotInner>>;
 
 pub fn new_frame_slot() -> FrameSlot {
-    Arc::new(Mutex::new(None))
+    Arc::new(Mutex::new(FrameSlotInner::default()))
 }
 
 fn send_action(tx: &Sender<InputFrame>, action: SystemAction) {
@@ -151,7 +158,7 @@ unsafe fn nsstring_to_string(ns: *mut objc::runtime::Object) -> String {
 /// editing keys, everything else is text (the layout-resolved characters, so any
 /// keyboard layout already gave us the right glyph). Handled events are swallowed.
 #[cfg(target_os = "macos")]
-fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>) {
+fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>, fps_toggle: Arc<AtomicBool>) {
     use block::ConcreteBlock;
     use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};
@@ -183,6 +190,14 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>) {
                         b'l' | b'L' => send_action(&tx, SystemAction::Lock),
                         b't' | b'T' => send_action(&tx, SystemAction::AppSwitcher),
                         b'r' | b'R' => send_action(&tx, SystemAction::RotateLeft),
+                        b'i' | b'I' => {
+                            let prev = fps_toggle.fetch_xor(true, Ordering::Relaxed);
+                            if !prev {
+                                println!("[ioscpy] FPS counter started");
+                            } else {
+                                println!("[ioscpy] FPS counter stopped");
+                            }
+                        }
                         b'a' | b'A' => send_key(&tx, KeyCode::SelectAll),
                         b'c' | b'C' => send_key(&tx, KeyCode::Copy),
                         b'v' | b'V' => paste_now(&tx, &clip),
@@ -244,7 +259,7 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn install_key_monitor(_tx: Sender<InputFrame>, _clip: Arc<Mutex<ClipState>>) {}
+fn install_key_monitor(_tx: Sender<InputFrame>, _clip: Arc<Mutex<ClipState>>, _fps_toggle: Arc<AtomicBool>) {}
 
 /// Forwards typed characters from minifb's input callback to the device as text.
 /// It tracks Ctrl from the same key-event stream (via `set_key_state`) and drops
@@ -300,7 +315,12 @@ fn attach_text_input(_window: &mut Window, _tx: &Sender<InputFrame>) {}
 /// Backspace/arrows, and the Ctrl combos. macOS routes all of this through
 /// `install_key_monitor`, so this is Linux/Windows only.
 #[cfg(not(target_os = "macos"))]
-fn pump_keys(window: &Window, tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
+fn pump_keys(
+    window: &Window,
+    tx: &Sender<InputFrame>,
+    clip: &Arc<Mutex<ClipState>>,
+    fps_toggle: &Arc<AtomicBool>,
+) {
     use minifb::{Key, KeyRepeat};
 
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
@@ -313,6 +333,14 @@ fn pump_keys(window: &Window, tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipStat
                 Key::L => send_action(tx, SystemAction::Lock),
                 Key::T => send_action(tx, SystemAction::AppSwitcher),
                 Key::R => send_action(tx, SystemAction::RotateLeft),
+                Key::I => {
+                    let prev = fps_toggle.fetch_xor(true, Ordering::Relaxed);
+                    if !prev {
+                        println!("[ioscpy] FPS counter started");
+                    } else {
+                        println!("[ioscpy] FPS counter stopped");
+                    }
+                }
                 Key::A => send_key(tx, KeyCode::SelectAll),
                 Key::C => send_key(tx, KeyCode::Copy),
                 Key::V => paste_now(tx, clip),
@@ -478,6 +506,50 @@ fn screen_visible_size() -> (f64, f64) {
 /// for us, as its POSIX scaler shears the image when the buffer is taller
 /// than the window (it swaps width/height into `image_resize_linear_stride`),
 /// so we letterbox ourselves and blit the result 1:1 with `Stretch`.
+/// Precomputed horizontal sample positions and weights for faster scaling.
+struct XSample {
+    x0: usize,
+    x1: usize,
+    wx: u32,
+}
+
+/// Bilinear blend of four `0x00RRGGBB` pixels using fixed-point integer math (0..=256 weights).
+#[inline(always)]
+fn bilerp_fast(p00: u32, p10: u32, p01: u32, p11: u32, wx: u32, wy: u32) -> u32 {
+    let inv_wx = 256 - wx;
+    let inv_wy = 256 - wy;
+
+    // RB channels (mask 0x00FF00FF)
+    let rb00 = p00 & 0x00FF00FF;
+    let rb10 = p10 & 0x00FF00FF;
+    let rb01 = p01 & 0x00FF00FF;
+    let rb11 = p11 & 0x00FF00FF;
+
+    // G channel (mask 0x0000FF00)
+    let g00 = (p00 >> 8) & 0xFF;
+    let g10 = (p10 >> 8) & 0xFF;
+    let g01 = (p01 >> 8) & 0xFF;
+    let g11 = (p11 >> 8) & 0xFF;
+
+    let rb_top = rb00 * inv_wx + rb10 * wx;
+    let rb_bot = rb01 * inv_wx + rb11 * wx;
+    let rb = ((rb_top >> 8) * inv_wy + (rb_bot >> 8) * wy) >> 8;
+
+    let g_top = g00 * inv_wx + g10 * wx;
+    let g_bot = g01 * inv_wx + g11 * wx;
+    let g = ((g_top >> 8) * inv_wy + (g_bot >> 8) * wy) >> 8;
+
+    (rb & 0x00FF00FF) | ((g & 0xFF) << 8)
+}
+
+/// Bilinearly scale `src` into the `[0, content_w)` columns of `dst`, a
+/// `stride`-wide by `out_h`-tall buffer that also holds the sidebar past
+/// `content_w`. Keeps the device aspect ratio and centers it with black bars
+/// (letterbox) within that column range; `dst` must already be cleared to the
+/// letterbox color. minifb's `AspectRatioStretch` can't do this letterboxing
+/// for us, as its POSIX scaler shears the image when the buffer is taller
+/// than the window (it swaps width/height into `image_resize_linear_stride`),
+/// so we letterbox ourselves and blit the result 1:1 with `Stretch`.
 fn scale_frame(src: &DecodedFrame, content_w: usize, out_h: usize, stride: usize, dst: &mut [u32]) {
     let content_w = content_w.max(1);
     let out_h = out_h.max(1);
@@ -488,52 +560,50 @@ fn scale_frame(src: &DecodedFrame, content_w: usize, out_h: usize, stride: usize
     let x_off = (content_w - dw) / 2;
     let y_off = (out_h - dh) / 2;
 
+    // 1:1 direct blit fast path
+    if dw == src.width && dh == src.height {
+        for y in 0..dh {
+            let srow = y * src.width;
+            let drow = (y + y_off) * stride + x_off;
+            dst[drow..drow + dw].copy_from_slice(&src.buf[srow..srow + dw]);
+        }
+        return;
+    }
+
     let inv_x = src.width as f32 / dw as f32;
     let inv_y = src.height as f32 / dh as f32;
     let last_x = src.width - 1;
     let last_y = src.height - 1;
+
+    // Precalculate horizontal sample coordinates to avoid repeated math per row
+    let mut x_lut = Vec::with_capacity(dw);
+    for x in 0..dw {
+        let fx = ((x as f32 + 0.5) * inv_x - 0.5).max(0.0);
+        let x0 = (fx as usize).min(last_x);
+        let x1 = (x0 + 1).min(last_x);
+        let wx = ((fx - x0 as f32) * 256.0).round() as u32;
+        x_lut.push(XSample { x0, x1, wx });
+    }
+
     for y in 0..dh {
         let fy = ((y as f32 + 0.5) * inv_y - 0.5).max(0.0);
         let y0 = (fy as usize).min(last_y);
         let y1 = (y0 + 1).min(last_y);
-        let wy = fy - y0 as f32;
+        let wy = ((fy - y0 as f32) * 256.0).round() as u32;
         let srow0 = y0 * src.width;
         let srow1 = y1 * src.width;
         let drow = (y + y_off) * stride + x_off;
-        for x in 0..dw {
-            let fx = ((x as f32 + 0.5) * inv_x - 0.5).max(0.0);
-            let x0 = (fx as usize).min(last_x);
-            let x1 = (x0 + 1).min(last_x);
-            let wx = fx - x0 as f32;
-            dst[drow + x] = bilerp(
-                src.buf[srow0 + x0],
-                src.buf[srow0 + x1],
-                src.buf[srow1 + x0],
-                src.buf[srow1 + x1],
-                wx,
+        for (x, sample) in x_lut.iter().enumerate() {
+            dst[drow + x] = bilerp_fast(
+                src.buf[srow0 + sample.x0],
+                src.buf[srow0 + sample.x1],
+                src.buf[srow1 + sample.x0],
+                src.buf[srow1 + sample.x1],
+                sample.wx,
                 wy,
             );
         }
     }
-}
-
-/// Bilinear blend of four `0x00RRGGBB` pixels.
-#[inline]
-fn bilerp(p00: u32, p10: u32, p01: u32, p11: u32, wx: f32, wy: f32) -> u32 {
-    let mut out = 0u32;
-    let mut shift = 0;
-    while shift <= 16 {
-        let c00 = ((p00 >> shift) & 0xff) as f32;
-        let c10 = ((p10 >> shift) & 0xff) as f32;
-        let c01 = ((p01 >> shift) & 0xff) as f32;
-        let c11 = ((p11 >> shift) & 0xff) as f32;
-        let top = c00 + (c10 - c00) * wx;
-        let bot = c01 + (c11 - c01) * wx;
-        let v = (top + (bot - top) * wy) as u32;
-        out |= (v & 0xff) << shift;
-        shift += 8;
-    }
-    out
 }
 
 /// Run the window loop on the calling (main) thread until the window closes or
@@ -544,6 +614,7 @@ pub fn run_window(
     stop: Arc<AtomicBool>,
     input_tx: Sender<InputFrame>,
     clip_in: Receiver<String>,
+    print_fps: bool,
 ) -> Result<()> {
     let first = match wait_for_first_frame(&frames, &stop) {
         Some(f) => f,
@@ -562,7 +633,11 @@ pub fn run_window(
     let (win_w, win_h) = scaled_fit(first.width, first.height, display_scale, sidebar::WIDTH);
     let mut window = open_window(title, win_w, win_h)?;
     let clip = Arc::new(Mutex::new(ClipState::default()));
-    install_key_monitor(input_tx.clone(), clip.clone());
+    let fps_enabled = Arc::new(AtomicBool::new(print_fps));
+    if print_fps {
+        println!("[ioscpy] FPS counter started");
+    }
+    install_key_monitor(input_tx.clone(), clip.clone(), fps_enabled.clone());
     attach_text_input(&mut window, &input_tx);
 
     let mut current = first;
@@ -570,10 +645,52 @@ pub fn run_window(
     let mut input = InputState::default();
     let mut combined: Vec<u32> = Vec::new();
     let mut last_clip_poll = Instant::now();
+
+    let mut rendered_frames = 0u64;
+    let mut last_fps_instant = Instant::now();
+    let mut last_rendered_count = 0u64;
+    let mut last_dropped_count = 0u64;
+    let mut last_fps_was_enabled = print_fps;
+    let mut dirty = true;
+
     while window.is_open() && !stop.load(Ordering::Relaxed) {
-        // Take the newest decoded frame, dropping any older one.
-        if let Some(decoded) = frames.lock().unwrap().take() {
+        // Take the newest decoded frame, and read dropped stats
+        let (new_frame, _incoming_total, dropped_total) = {
+            let mut lock = frames.lock().unwrap();
+            (lock.frame.take(), lock.incoming, lock.dropped)
+        };
+
+        if let Some(decoded) = new_frame {
             current = decoded;
+            dirty = true;
+            rendered_frames += 1;
+        }
+
+        let is_fps_on = fps_enabled.load(Ordering::Relaxed);
+        if last_fps_was_enabled && !is_fps_on {
+            window.set_title(title);
+        }
+        last_fps_was_enabled = is_fps_on;
+
+        if last_fps_instant.elapsed() >= Duration::from_secs(1) {
+            let elapsed = last_fps_instant.elapsed().as_secs_f64();
+            let rendered_delta = rendered_frames - last_rendered_count;
+            let dropped_delta = dropped_total - last_dropped_count;
+            last_rendered_count = rendered_frames;
+            last_dropped_count = dropped_total;
+            last_fps_instant = Instant::now();
+
+            let fps = rendered_delta as f64 / elapsed;
+
+            if is_fps_on {
+                if dropped_delta > 0 {
+                    println!("{:.1} fps (+{} frames dropped)", fps, dropped_delta);
+                    window.set_title(&format!("{title} ({:.1} fps, {} dropped)", fps, dropped_delta));
+                } else {
+                    println!("{:.1} fps", fps);
+                    window.set_title(&format!("{title} ({:.1} fps)", fps));
+                }
+            }
         }
 
         // If the frame's shape flipped the phone rotated. Reopen the window at the
@@ -588,6 +705,7 @@ pub fn run_window(
                 attach_text_input(&mut w, &input_tx);
                 window = w;
             }
+            dirty = true;
         }
 
         // Window points: the sidebar is a fixed-width strip on the right, the
@@ -596,9 +714,11 @@ pub fn run_window(
         let content_w = gw.saturating_sub(sidebar::WIDTH).max(1);
 
         let input_ctx = InputCtx { content_w, win_h: gh, tx: &input_tx, clip: &clip };
+        let prev_sidebar_down = input.sidebar_down;
         pump_input(&window, &current, &mut input, &input_ctx);
         #[cfg(not(target_os = "macos"))]
-        pump_keys(&window, &input_tx, &clip);
+        pump_keys(&window, &input_tx, &clip, &fps_enabled);
+        let sidebar_changed = prev_sidebar_down != input.sidebar_down;
 
         // Render a window-sized, letterboxed buffer at the backing (retina)
         // resolution for minifb to blit 1:1. Both axes are capped together so a
@@ -615,10 +735,19 @@ pub fn run_window(
         let sb_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
         let stride = content_px + sb_px;
 
-        combined.clear();
-        combined.resize(stride * total_h, 0);
-        scale_frame(&current, content_px, total_h, stride, &mut combined);
-        sidebar::draw_into(&mut combined, stride, content_px, sb_px, total_h, input.sidebar_down);
+        if combined.len() != stride * total_h {
+            combined.resize(stride * total_h, 0);
+            dirty = true;
+        }
+
+        if dirty {
+            combined.fill(0);
+            scale_frame(&current, content_px, total_h, stride, &mut combined);
+            sidebar::draw_into(&mut combined, stride, content_px, sb_px, total_h, input.sidebar_down);
+            dirty = false;
+        } else if sidebar_changed {
+            sidebar::draw_into(&mut combined, stride, content_px, sb_px, total_h, input.sidebar_down);
+        }
 
         window
             .update_with_buffer(&combined, stride, total_h)
@@ -725,7 +854,7 @@ fn send_touch(tx: &Sender<InputFrame>, phase: TouchPhase, x: f32, y: f32) {
 fn wait_for_first_frame(frames: &FrameSlot, stop: &Arc<AtomicBool>) -> Option<DecodedFrame> {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-        if let Some(decoded) = frames.lock().unwrap().take() {
+        if let Some(decoded) = frames.lock().unwrap().frame.take() {
             return Some(decoded);
         }
         std::thread::sleep(Duration::from_millis(20));
