@@ -67,7 +67,12 @@ static uint64_t clipHash(NSString *t) {
 - (instancetype)init {
     if ((self = [super init])) {
         _fd = -1;
-        _captureQueue = dispatch_queue_create("com.ioscpy.capture", DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL,
+            QOS_CLASS_USER_INTERACTIVE,
+            0
+        );
+        _captureQueue = dispatch_queue_create("com.ioscpy.capture", qos);
         _clipQueue = dispatch_queue_create("com.ioscpy.clip", DISPATCH_QUEUE_SERIAL);
     }
     return self;
@@ -288,7 +293,7 @@ static uint64_t clipHash(NSString *t) {
     }
     _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _captureQueue);
     uint64_t interval = (uint64_t)(kInterval * NSEC_PER_SEC);
-    dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, interval, interval / 4);
+    dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, interval, 0);
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_timer, ^{ [weakSelf captureAndSend]; });
     dispatch_resume(_timer);
