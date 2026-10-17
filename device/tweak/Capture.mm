@@ -70,27 +70,36 @@ static CFStringRef mainDisplayName(void) {
     return name;
 }
 
-// Reusable destination surface, recreated only when the target size changes.
-static IOSurfaceRef surfaceForSize(int width, int height) {
-    static IOSurfaceRef surface = NULL;
-    static int cachedW = 0, cachedH = 0;
-    if (surface && cachedW == width && cachedH == height) {
-        return surface;
+// 3-surface ring buffer so the CoreAnimation GPU render and VideoToolbox hardware
+// encoder run concurrently in a pipelined fashion without waiting on each other.
+#define IOSPY_SURFACE_POOL_SIZE 3
+static IOSurfaceRef gSurfaces[IOSPY_SURFACE_POOL_SIZE] = {NULL, NULL, NULL};
+static int gSurfaceIndex = 0;
+static int cachedW = 0, cachedH = 0;
+
+static IOSurfaceRef nextSurfaceForSize(int width, int height) {
+    if (cachedW != width || cachedH != height) {
+        for (int i = 0; i < IOSPY_SURFACE_POOL_SIZE; i++) {
+            if (gSurfaces[i]) {
+                CFRelease(gSurfaces[i]);
+                gSurfaces[i] = NULL;
+            }
+        }
+        cachedW = width;
+        cachedH = height;
     }
-    if (surface) {
-        CFRelease(surface);
-        surface = NULL;
+    int idx = gSurfaceIndex;
+    gSurfaceIndex = (gSurfaceIndex + 1) % IOSPY_SURFACE_POOL_SIZE;
+    if (!gSurfaces[idx]) {
+        NSDictionary *props = @{
+            (id)kIOSurfaceWidth: @(width),
+            (id)kIOSurfaceHeight: @(height),
+            (id)kIOSurfaceBytesPerElement: @4,
+            (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+        };
+        gSurfaces[idx] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     }
-    NSDictionary *props = @{
-        (id)kIOSurfaceWidth: @(width),
-        (id)kIOSurfaceHeight: @(height),
-        (id)kIOSurfaceBytesPerElement: @4,
-        (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
-    };
-    surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-    cachedW = width;
-    cachedH = height;
-    return surface;
+    return gSurfaces[idx];
 }
 
 // Fast path: CARenderServer blits the native screen straight into a GPU IOSurface,
@@ -113,7 +122,7 @@ IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int 
             return NULL;
         }
 
-        IOSurfaceRef src = surfaceForSize(nw, nh);
+        IOSurfaceRef src = nextSurfaceForSize(nw, nh);
         if (!src) {
             return NULL;
         }
@@ -159,7 +168,7 @@ NSData *IOSPYCaptureScreenJPEG(CGFloat maxDimension, CGFloat quality,
         int tw = (int)target.width;
         int th = (int)target.height;
 
-        IOSurfaceRef surface = surfaceForSize(nw, nh);
+        IOSurfaceRef surface = nextSurfaceForSize(nw, nh);
         if (!surface) {
             return nil;
         }

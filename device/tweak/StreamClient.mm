@@ -310,6 +310,13 @@ static uint64_t clipHash(NSString *t) {
     [_encoder invalidate];
 }
 
+- (void)fallbackToMJPEG {
+    [_encoder invalidate];
+    _encoder = nil;
+    _codec = IOSPY_VIDEO_CODEC_MJPEG;
+    NSLog(@"[ioscpyhook] H.264 unavailable; using MJPEG");
+}
+
 - (void)captureAndSend {
     int fd = _fd;
     if (fd < 0) {
@@ -319,14 +326,7 @@ static uint64_t clipHash(NSString *t) {
         if ([self captureAndSendH264:fd]) {
             return;
         }
-        // H.264 isn't usable on this device/OS, so drop to MJPEG for the rest of
-        // the session and the screen still shows. The host follows the per-frame
-        // flags, so it adapts on its own. Tear the encoder down (and force a fresh
-        // one if H.264 is requested again) so a half-failed session isn't reused.
-        [_encoder invalidate];
-        _encoder = nil;
-        _codec = IOSPY_VIDEO_CODEC_MJPEG;
-        NSLog(@"[ioscpyhook] H.264 unavailable; using MJPEG");
+        [self fallbackToMJPEG];
     }
     [self captureAndSendJPEG:fd];
 }
@@ -380,29 +380,43 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     if (fps < 1) {
         fps = 1;
     }
-    BOOL isKey = NO;
-    NSData *avcc = [_encoder encodeSurface:surface
-                                     width:width
-                                    height:height
-                                       fps:fps
-                             forceKeyframe:_needKeyframe
-                                  keyframe:&isKey];
-    if (!avcc) {
-        return NO; // hard failure, fall back to MJPEG
-    }
-    if (avcc.length == 0) {
-        return YES; // dropped this tick, encoder still healthy
-    }
-    if (isKey) {
+    BOOL forceKey = _needKeyframe;
+    if (forceKey) {
         _needKeyframe = NO;
     }
-    uint32_t flags = IOSPY_VIDEO_FLAG_H264 | orientationFlags();
-    if (isKey) {
-        flags |= IOSPY_VIDEO_FLAG_KEYFRAME | IOSPY_VIDEO_FLAG_CONFIG;
-    }
-    IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
-                    makeVideoFrame(width, height, flags, avcc));
-    return YES;
+
+    __weak typeof(self) weakSelf = self;
+    return [_encoder encodeSurface:surface
+                             width:width
+                            height:height
+                               fps:fps
+                     forceKeyframe:forceKey
+                           handler:^(NSData *avcc, BOOL isKey, BOOL failed) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+        if (failed) {
+            dispatch_async(strongSelf->_captureQueue, ^{
+                [strongSelf fallbackToMJPEG];
+            });
+            return;
+        }
+        if (avcc.length == 0) {
+            return; // dropped this tick by encoder
+        }
+        uint32_t flags = IOSPY_VIDEO_FLAG_H264 | orientationFlags();
+        if (isKey) {
+            flags |= IOSPY_VIDEO_FLAG_KEYFRAME | IOSPY_VIDEO_FLAG_CONFIG;
+        }
+        NSData *frame = makeVideoFrame(width, height, flags, avcc);
+        dispatch_async(strongSelf->_captureQueue, ^{
+            int currentFd = strongSelf->_fd;
+            if (currentFd >= 0) {
+                IOSPYWriteFrame(currentFd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0, frame);
+            }
+        });
+    }];
 }
 
 @end
