@@ -3,8 +3,8 @@
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
     use crate::protocol::{self, MessageType, CHANNEL_VIDEO};
+    use std::time::Instant;
 
     #[test]
     fn bench_protocol_parsing_throughput() {
@@ -46,7 +46,10 @@ mod tests {
         println!("  Throughput:    {:.2} million pkts/sec", mps);
         println!("===========================================");
         assert_eq!(parsed_frames, iterations as u64);
-        assert!(nanos_per_op < 500.0, "Parsing must be faster than 500ns per packet in debug mode");
+        assert!(
+            nanos_per_op < 500.0,
+            "Parsing must be faster than 500ns per packet in debug mode"
+        );
     }
 
     #[test]
@@ -64,7 +67,8 @@ mod tests {
                 CHANNEL_VIDEO,
                 i as u64,
                 &payload,
-            ).unwrap();
+            )
+            .unwrap();
 
             let mut cursor = std::io::Cursor::new(&buf);
             let frame = protocol::read_frame(&mut cursor).unwrap();
@@ -73,7 +77,8 @@ mod tests {
 
         let elapsed = start.elapsed();
         let time_per_op = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
-        let mb_per_sec = (payload.len() as f64 * iterations as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+        let mb_per_sec =
+            (payload.len() as f64 * iterations as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0);
 
         println!("\n=== Benchmark: Wire Framing Serialization (16KB) ===");
         println!("  Iterations:    {iterations}");
@@ -95,9 +100,11 @@ mod tests {
         }
         let elapsed = start.elapsed();
         println!("\n=== Benchmark: H264 Decoder Initialization ===");
-        println!("  Created 50 instances in {:.2} ms ({:.2} ms/instance)",
-                 elapsed.as_secs_f64() * 1000.0,
-                 elapsed.as_secs_f64() * 1000.0 / 50.0);
+        println!(
+            "  Created 50 instances in {:.2} ms ({:.2} ms/instance)",
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0 / 50.0
+        );
         println!("==============================================");
         assert!(!decoders.is_empty(), "Must successfully initialize decoder");
     }

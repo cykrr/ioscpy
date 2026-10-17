@@ -347,6 +347,68 @@ fn screen_visible_size() -> (f64, f64) {
     (1440.0, 900.0)
 }
 
+#[cfg(target_os = "windows")]
+#[allow(clippy::upper_case_acronyms)]
+mod win32_api {
+    pub type HWND = *mut std::ffi::c_void;
+    pub type BOOL = i32;
+    pub type SHORT = i16;
+
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn SetCapture(hWnd: HWND) -> HWND;
+        pub fn ReleaseCapture() -> BOOL;
+        pub fn GetAsyncKeyState(vKey: i32) -> SHORT;
+    }
+
+    pub const VK_LBUTTON: i32 = 0x01;
+}
+
+#[cfg(target_os = "windows")]
+fn capture_mouse(window: &Window) {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+            unsafe {
+                win32_api::SetCapture(win32.hwnd.get() as _);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn capture_mouse(_window: &Window) {}
+
+#[cfg(target_os = "windows")]
+fn release_mouse_capture() {
+    unsafe {
+        win32_api::ReleaseCapture();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn release_mouse_capture() {}
+
+#[cfg(target_os = "windows")]
+fn is_physical_lbutton_down() -> bool {
+    unsafe { (win32_api::GetAsyncKeyState(win32_api::VK_LBUTTON) as u16 & 0x8000) != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn is_physical_lbutton_down() -> bool {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let buttons: usize = msg_send![class!(NSEvent), pressedMouseButtons];
+        (buttons & 1) != 0
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn is_physical_lbutton_down() -> bool {
+    true
+}
+
 /// Window size for a `w`x`h` device frame at the given scale, clamped to at most
 /// about 92% of the screen while keeping the aspect ratio. `sidebar_w` is a
 /// fixed-width budget added to the window width.
@@ -833,7 +895,10 @@ impl WgpuRenderer {
 #[derive(Default)]
 struct InputState {
     touching: bool,
-    last: (f32, f32),
+    last_sent: (f32, f32),
+    last_cursor_norm: (f32, f32),
+    last_move_sent: Option<Instant>,
+    pending_move: Option<(f32, f32)>,
     sidebar_down: Option<usize>,
 }
 
@@ -899,6 +964,31 @@ impl App {
             window: None,
             renderer: None,
         }
+    }
+
+    fn release_touch(&mut self) {
+        if self.input_state.touching {
+            send_touch(
+                &self.input_tx,
+                TouchPhase::Up,
+                self.input_state.last_cursor_norm.0,
+                self.input_state.last_cursor_norm.1,
+            );
+            self.input_state.touching = false;
+            self.input_state.pending_move = None;
+            self.input_state.last_move_sent = None;
+        }
+    }
+
+    fn release_all_inputs(&mut self) {
+        self.release_touch();
+        if self.input_state.sidebar_down.take().is_some() {
+            self.update_sidebar_texture(None);
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+        release_mouse_capture();
     }
 
     fn scale_factor(&self) -> f32 {
@@ -1100,8 +1190,12 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
+                self.release_all_inputs();
                 self.stop.store(true, Ordering::Relaxed);
                 event_loop.exit();
+            }
+            WindowEvent::Focused(false) => {
+                self.release_all_inputs();
             }
             WindowEvent::Resized(new_size) => {
                 if let Some(renderer) = &mut self.renderer {
@@ -1232,9 +1326,25 @@ impl ApplicationHandler<UserEvent> for App {
                                 fh,
                             );
 
-                            if nx != self.input_state.last.0 || ny != self.input_state.last.1 {
-                                send_touch(&self.input_tx, TouchPhase::Move, nx, ny);
-                                self.input_state.last = (nx, ny);
+                            self.input_state.last_cursor_norm = (nx, ny);
+
+                            if nx != self.input_state.last_sent.0
+                                || ny != self.input_state.last_sent.1
+                            {
+                                const MOVE_INTERVAL: Duration = Duration::from_millis(8);
+                                let should_send = match self.input_state.last_move_sent {
+                                    Some(last) => last.elapsed() >= MOVE_INTERVAL,
+                                    None => true,
+                                };
+
+                                if should_send {
+                                    send_touch(&self.input_tx, TouchPhase::Move, nx, ny);
+                                    self.input_state.last_sent = (nx, ny);
+                                    self.input_state.last_move_sent = Some(Instant::now());
+                                    self.input_state.pending_move = None;
+                                } else {
+                                    self.input_state.pending_move = Some((nx, ny));
+                                }
                             }
                         }
                     }
@@ -1246,6 +1356,10 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => match state {
                 ElementState::Pressed => {
+                    if let Some(w) = &self.window {
+                        capture_mouse(w);
+                    }
+
                     if let Some(renderer) = &self.renderer {
                         let scale_factor = self.scale_factor();
                         let sidebar_w_px = (sidebar::WIDTH as f32 * scale_factor)
@@ -1258,6 +1372,11 @@ impl ApplicationHandler<UserEvent> for App {
                         let my = self.cursor_pos.1;
 
                         if mx < content_w_px {
+                            // Safety: lift previous touch cleanly before starting a new one
+                            if self.input_state.touching {
+                                self.release_touch();
+                            }
+
                             // Touch event on mirror screen
                             let fw = self.current_frame.width as f32;
                             let fh = self.current_frame.height as f32;
@@ -1287,7 +1406,10 @@ impl ApplicationHandler<UserEvent> for App {
                                     );
                                     send_touch(&self.input_tx, TouchPhase::Down, nx, ny);
                                     self.input_state.touching = true;
-                                    self.input_state.last = (nx, ny);
+                                    self.input_state.last_sent = (nx, ny);
+                                    self.input_state.last_cursor_norm = (nx, ny);
+                                    self.input_state.last_move_sent = Some(Instant::now());
+                                    self.input_state.pending_move = None;
                                 }
                             }
                         } else if sidebar_w_px > 0.0 {
@@ -1311,21 +1433,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 ElementState::Released => {
-                    if self.input_state.touching {
-                        send_touch(
-                            &self.input_tx,
-                            TouchPhase::Up,
-                            self.input_state.last.0,
-                            self.input_state.last.1,
-                        );
-                        self.input_state.touching = false;
-                    }
-                    if self.input_state.sidebar_down.take().is_some() {
-                        self.update_sidebar_texture(None);
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
-                    }
+                    self.release_all_inputs();
                 }
             },
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -1340,8 +1448,36 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.stop.load(Ordering::Relaxed) {
+            self.release_all_inputs();
             event_loop.exit();
             return;
+        }
+
+        // Safety net: check if the physical mouse button was released outside our event stream
+        if (self.input_state.touching || self.input_state.sidebar_down.is_some())
+            && !is_physical_lbutton_down()
+        {
+            self.release_all_inputs();
+        }
+
+        // Flush any pending throttled move if interval has elapsed
+        if self.input_state.touching {
+            if let Some(pos) = self.input_state.pending_move {
+                const MOVE_INTERVAL: Duration = Duration::from_millis(8);
+                if self
+                    .input_state
+                    .last_move_sent
+                    .map(|t| t.elapsed() >= MOVE_INTERVAL)
+                    .unwrap_or(true)
+                {
+                    if pos != self.input_state.last_sent {
+                        send_touch(&self.input_tx, TouchPhase::Move, pos.0, pos.1);
+                        self.input_state.last_sent = pos;
+                        self.input_state.last_move_sent = Some(Instant::now());
+                    }
+                    self.input_state.pending_move = None;
+                }
+            }
         }
 
         // Push host clipboard changes to the device (rate-limited)
@@ -1361,10 +1497,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
-        // Event-driven wait: wake up on events or after 50ms for clipboard poll
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(50),
-        ));
+        // Event-driven wait: shorter timer when touching for responsive throttle flush and button checks
+        let wait_duration = if self.input_state.touching {
+            Duration::from_millis(8)
+        } else {
+            Duration::from_millis(50)
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait_duration));
     }
 }
 

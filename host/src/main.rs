@@ -4,6 +4,8 @@
 //! handshakes with the daemon, and opens the session. Flags only pick a device
 //! or turn on diagnostics.
 
+#[cfg(test)]
+mod benchmarks;
 mod cli;
 mod clipboard;
 mod config;
@@ -25,8 +27,6 @@ mod video;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod wayland_compat;
 mod window;
-#[cfg(test)]
-mod benchmarks;
 
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -391,7 +391,13 @@ fn calc_bench_stats(mut samples: Vec<f64>) -> Option<BenchStats> {
     let avg = samples.iter().sum::<f64>() / len as f64;
     let p50 = samples[len * 50 / 100];
     let p95 = samples[(len * 95 / 100).min(len - 1)];
-    Some(BenchStats { min, avg, p50, p95, max })
+    Some(BenchStats {
+        min,
+        avg,
+        p50,
+        p95,
+        max,
+    })
 }
 
 /// Stream for `secs` seconds with no window and print a detailed benchmark report.
@@ -515,21 +521,38 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     println!("  Stream:       {kind} ({w}x{h})");
     println!("  Duration:     {elapsed:.2}s | Received: {frames} frames ({decoded} decoded, {keyframes} keyframes)");
     println!("  Framerate:    {fps:.2} FPS");
-    println!("  Bitrate:      {:.2} Mbps (~{:.1} KB/frame, {:.2} MB/s wire)",
-             (bytes as f64 * 8.0) / (elapsed * 1_000_000.0),
-             bytes as f64 / n / 1024.0,
-             bytes as f64 / elapsed / (1024.0 * 1024.0));
+    println!(
+        "  Bitrate:      {:.2} Mbps (~{:.1} KB/frame, {:.2} MB/s wire)",
+        (bytes as f64 * 8.0) / (elapsed * 1_000_000.0),
+        bytes as f64 / n / 1024.0,
+        bytes as f64 / elapsed / (1024.0 * 1024.0)
+    );
     println!("\n  --- Latency Distributions (milliseconds) -----------------------------------");
-    println!("  {: <18} {: >8} {: >8} {: >8} {: >8} {: >8}", "Metric", "Min", "Avg", "P50", "P95", "Max");
-    println!("  {:-<18} {:-<8} {:-<8} {:-<8} {:-<8} {:-<8}", "", "", "", "", "", "");
+    println!(
+        "  {: <18} {: >8} {: >8} {: >8} {: >8} {: >8}",
+        "Metric", "Min", "Avg", "P50", "P95", "Max"
+    );
+    println!(
+        "  {:-<18} {:-<8} {:-<8} {:-<8} {:-<8} {:-<8}",
+        "", "", "", "", "", ""
+    );
     if let Some(s) = calc_bench_stats(interval_samples) {
-        println!("  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}", "Frame Interval", s.min, s.avg, s.p50, s.p95, s.max);
+        println!(
+            "  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}",
+            "Frame Interval", s.min, s.avg, s.p50, s.p95, s.max
+        );
     }
     if let Some(s) = calc_bench_stats(read_samples) {
-        println!("  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}", "Network Read", s.min, s.avg, s.p50, s.p95, s.max);
+        println!(
+            "  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}",
+            "Network Read", s.min, s.avg, s.p50, s.p95, s.max
+        );
     }
     if let Some(s) = calc_bench_stats(decode_samples) {
-        println!("  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}", "Host Decode", s.min, s.avg, s.p50, s.p95, s.max);
+        println!(
+            "  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}",
+            "Host Decode", s.min, s.avg, s.p50, s.p95, s.max
+        );
     }
     if !device_perf_logs.is_empty() {
         println!("\n  --- Device Pipeline Telemetry (reported by iPhone) -----------------------");
