@@ -4,6 +4,7 @@
 #import <ImageIO/ImageIO.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 #import <CoreServices/UTCoreTypes.h>
+#import <Accelerate/Accelerate.h>
 #import <dlfcn.h>
 
 // The render server can blit the live display straight into an IOSurface. It's
@@ -145,45 +146,49 @@ IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int 
         if (th < 2) th = 2;
 
         IOSurfaceRef src = surfaceForSize(nw, nh);
-        IOSurfaceRef dst = destSurfaceForSize(tw, th);
-        if (!src || !dst) {
+        if (!src) {
             return NULL;
         }
 
-        const uint32_t bgra = kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little;
-        CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
         render(0, mainDisplayName(), src, 0, 0);
 
-        IOSurfaceLock(src, kIOSurfaceLockReadOnly, NULL);
-        void *base = IOSurfaceGetBaseAddress(src);
-        size_t bytesPerRow = IOSurfaceGetBytesPerRow(src);
-        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, base, bytesPerRow * nh, NULL);
-        CGImageRef nativeImage = CGImageCreate(nw, nh, 8, 32, bytesPerRow, space, bgra, provider,
-                                               NULL, false, kCGRenderingIntentDefault);
-
-        BOOL ok = NO;
-        if (nativeImage) {
-            IOSurfaceLock(dst, 0, NULL);
-            void *dbase = IOSurfaceGetBaseAddress(dst);
-            size_t dbpr = IOSurfaceGetBytesPerRow(dst);
-            CGContextRef ctx = CGBitmapContextCreate(dbase, tw, th, 8, dbpr, space, bgra);
-            if (ctx) {
-                CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
-                CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), nativeImage);
-                CGContextRelease(ctx);
-                ok = YES;
-            }
-            IOSurfaceUnlock(dst, 0, NULL);
+        // Fast path: if target matches native screen resolution, return the rendered
+        // IOSurface directly without any scaling or copies.
+        if (tw == nw && th == nh) {
+            if (outWidth) *outWidth = tw;
+            if (outHeight) *outHeight = th;
+            return src;
         }
 
-        CGImageRelease(nativeImage);
-        CGDataProviderRelease(provider);
-        IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
-        CGColorSpaceRelease(space);
-
-        if (!ok) {
+        IOSurfaceRef dst = destSurfaceForSize(tw, th);
+        if (!dst) {
             return NULL;
         }
+
+        // Fast hardware vector scaling via Accelerate vImageScale (NEON SIMD),
+        // bypassing slow CPU CoreGraphics software drawing.
+        IOSurfaceLock(src, kIOSurfaceLockReadOnly, NULL);
+        IOSurfaceLock(dst, 0, NULL);
+        vImage_Buffer srcBuf = {
+            .data = IOSurfaceGetBaseAddress(src),
+            .height = (vImagePixelCount)nh,
+            .width = (vImagePixelCount)nw,
+            .rowBytes = IOSurfaceGetBytesPerRow(src),
+        };
+        vImage_Buffer dstBuf = {
+            .data = IOSurfaceGetBaseAddress(dst),
+            .height = (vImagePixelCount)th,
+            .width = (vImagePixelCount)tw,
+            .rowBytes = IOSurfaceGetBytesPerRow(dst),
+        };
+        vImage_Error err = vImageScale_ARGB8888(&srcBuf, &dstBuf, NULL, kvImageHighQualityResampling);
+        IOSurfaceUnlock(dst, 0, NULL);
+        IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
+
+        if (err != kvImageNoError) {
+            return NULL;
+        }
+
         if (outWidth) {
             *outWidth = tw;
         }

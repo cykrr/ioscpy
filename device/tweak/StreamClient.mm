@@ -17,7 +17,7 @@
 // bandwidth and CPU.
 static const CGFloat kMaxDimension = 1600.0;
 static const CGFloat kQuality = 0.72;
-static const NSTimeInterval kInterval = 1.0 / 45.0;
+static const NSTimeInterval kInterval = 1.0 / 60.0;
 
 // clipboard sync bookkeeping (must hash byte-identically to the host)
 static uint64_t gLastSyncedHash = 0;
