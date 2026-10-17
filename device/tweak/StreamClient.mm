@@ -367,7 +367,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         _encoder = [[IOSPYH264Encoder alloc] init];
     }
     int width = 0, height = 0;
-    IOSurfaceRef surface = IOSPYCaptureScreenSurface(kMaxDimension, &width, &height);
+    IOSurfaceRef surface = IOSPYCaptureScreenSurface(0, &width, &height);
     if (!surface || width < 2 || height < 2) {
         return NO;
     }

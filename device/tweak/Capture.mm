@@ -4,7 +4,6 @@
 #import <ImageIO/ImageIO.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 #import <CoreServices/UTCoreTypes.h>
-#import <Accelerate/Accelerate.h>
 #import <dlfcn.h>
 
 // The render server can blit the live display straight into an IOSurface. It's
@@ -94,30 +93,9 @@ static IOSurfaceRef surfaceForSize(int width, int height) {
     return surface;
 }
 
-// Destination surface for the H.264 path, recreated only when the target size
-// changes. Kept separate from the native source surface above.
-static IOSurfaceRef destSurfaceForSize(int width, int height) {
-    static IOSurfaceRef surface = NULL;
-    static int cachedW = 0, cachedH = 0;
-    if (surface && cachedW == width && cachedH == height) {
-        return surface;
-    }
-    if (surface) {
-        CFRelease(surface);
-        surface = NULL;
-    }
-    NSDictionary *props = @{
-        (id)kIOSurfaceWidth: @(width),
-        (id)kIOSurfaceHeight: @(height),
-        (id)kIOSurfaceBytesPerElement: @4,
-        (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
-    };
-    surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-    cachedW = width;
-    cachedH = height;
-    return surface;
-}
-
+// Fast path: CARenderServer blits the native screen straight into a GPU IOSurface,
+// which is then wrapped directly by VideoToolbox for hardware H.264 encoding with
+// zero-copy and zero CPU usage.
 IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int *outHeight) {
     @autoreleasepool {
         CARenderServerRenderDisplayFn render = renderDisplayFn();
@@ -128,22 +106,12 @@ IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int 
         if (native.width < 1 || native.height < 1) {
             return NULL;
         }
-        int nw = (int)native.width;
-        int nh = (int)native.height;
-
-        CGSize target = native;
-        if (maxDimension > 0) {
-            CGFloat longest = MAX(native.width, native.height);
-            if (longest > maxDimension) {
-                CGFloat factor = maxDimension / longest;
-                target = CGSizeMake(round(native.width * factor), round(native.height * factor));
-            }
-        }
         // Round down to even dimensions for 4:2:0 H.264.
-        int tw = ((int)target.width) & ~1;
-        int th = ((int)target.height) & ~1;
-        if (tw < 2) tw = 2;
-        if (th < 2) th = 2;
+        int nw = ((int)native.width) & ~1;
+        int nh = ((int)native.height) & ~1;
+        if (nw < 2 || nh < 2) {
+            return NULL;
+        }
 
         IOSurfaceRef src = surfaceForSize(nw, nh);
         if (!src) {
@@ -152,50 +120,13 @@ IOSurfaceRef IOSPYCaptureScreenSurface(CGFloat maxDimension, int *outWidth, int 
 
         render(0, mainDisplayName(), src, 0, 0);
 
-        // Fast path: if target matches native screen resolution, return the rendered
-        // IOSurface directly without any scaling or copies.
-        if (tw == nw && th == nh) {
-            if (outWidth) *outWidth = tw;
-            if (outHeight) *outHeight = th;
-            return src;
-        }
-
-        IOSurfaceRef dst = destSurfaceForSize(tw, th);
-        if (!dst) {
-            return NULL;
-        }
-
-        // Fast hardware vector scaling via Accelerate vImageScale (NEON SIMD),
-        // bypassing slow CPU CoreGraphics software drawing.
-        IOSurfaceLock(src, kIOSurfaceLockReadOnly, NULL);
-        IOSurfaceLock(dst, 0, NULL);
-        vImage_Buffer srcBuf = {
-            .data = IOSurfaceGetBaseAddress(src),
-            .height = (vImagePixelCount)nh,
-            .width = (vImagePixelCount)nw,
-            .rowBytes = IOSurfaceGetBytesPerRow(src),
-        };
-        vImage_Buffer dstBuf = {
-            .data = IOSurfaceGetBaseAddress(dst),
-            .height = (vImagePixelCount)th,
-            .width = (vImagePixelCount)tw,
-            .rowBytes = IOSurfaceGetBytesPerRow(dst),
-        };
-        vImage_Error err = vImageScale_ARGB8888(&srcBuf, &dstBuf, NULL, kvImageHighQualityResampling);
-        IOSurfaceUnlock(dst, 0, NULL);
-        IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
-
-        if (err != kvImageNoError) {
-            return NULL;
-        }
-
         if (outWidth) {
-            *outWidth = tw;
+            *outWidth = nw;
         }
         if (outHeight) {
-            *outHeight = th;
+            *outHeight = nh;
         }
-        return dst;
+        return src;
     }
 }
 
