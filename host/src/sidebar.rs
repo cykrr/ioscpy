@@ -1,9 +1,6 @@
-//! Right-side button panel mirroring the existing keyboard shortcuts. minifb
-//! has no native widgets, so the panel is pixels drawn straight into the
-//! window buffer; this module only knows geometry and drawing, not how to
-//! send input (that stays in `window.rs`, next to the keyboard handlers it
-//! mirrors).
-//!
+#![allow(dead_code)]
+
+//! Right-side button panel mirroring the existing keyboard shortcuts.
 //! Icons are PNGs under `assets/icons/`, traced from the Lucide icon set
 //! (https://lucide.dev, ISC license), embedded with `include_bytes!` and
 //! decoded once, lazily, on first draw (see `icon_for`). To change an icon,
@@ -68,7 +65,14 @@ const DIVIDER: u32 = 0x00_18_18_18;
 /// it. `w` is the sidebar's on-screen width (already scaled to match the
 /// content buffer it sits beside). `pressed` highlights the button currently
 /// held down, if any.
-pub fn draw_into(buf: &mut [u32], stride: usize, x_off: usize, w: usize, h: usize, pressed: Option<usize>) {
+pub fn draw_into(
+    buf: &mut [u32],
+    stride: usize,
+    x_off: usize,
+    w: usize,
+    h: usize,
+    pressed: Option<usize>,
+) {
     if w == 0 || h == 0 {
         return;
     }
@@ -103,7 +107,15 @@ pub fn draw_into(buf: &mut [u32], stride: usize, x_off: usize, w: usize, h: usiz
 /// of the button at column range `[0, w)`, alpha-blending each covered pixel
 /// toward `ICON_COLOR` so anti-aliased edges from the source PNG carry over
 /// instead of hard-thresholding to on/off.
-fn draw_icon(buf: &mut [u32], stride: usize, x_off: usize, w: usize, action: Action, y0: usize, y1: usize) {
+fn draw_icon(
+    buf: &mut [u32],
+    stride: usize,
+    x_off: usize,
+    w: usize,
+    action: Action,
+    y0: usize,
+    y1: usize,
+) {
     let icon = icon_for(action);
     let size = (((y1 - y0).min(w) as f32) * 0.7) as usize;
     if size == 0 {
@@ -157,11 +169,24 @@ struct IconImage {
 
 fn decode_icon(png_bytes: &[u8]) -> IconImage {
     let decoder = png::Decoder::new(Cursor::new(png_bytes));
-    let mut reader = decoder.read_info().expect("bundled icon PNG is well-formed");
-    let mut buf = vec![0u8; reader.output_buffer_size().expect("bundled icon PNG has a known size")];
-    let info = reader.next_frame(&mut buf).expect("bundled icon PNG decodes");
+    let mut reader = decoder
+        .read_info()
+        .expect("bundled icon PNG is well-formed");
+    let mut buf = vec![
+        0u8;
+        reader
+            .output_buffer_size()
+            .expect("bundled icon PNG has a known size")
+    ];
+    let info = reader
+        .next_frame(&mut buf)
+        .expect("bundled icon PNG decodes");
     buf.truncate(info.buffer_size());
-    IconImage { w: info.width as usize, h: info.height as usize, rgba: buf }
+    IconImage {
+        w: info.width as usize,
+        h: info.height as usize,
+        rgba: buf,
+    }
 }
 
 struct IconSet {

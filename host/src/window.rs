@@ -1,9 +1,10 @@
-//! macOS render window. Opens a native window sized from the first frame and
-//! blits the latest frame each tick. The window owns the main thread; the network
-//! thread decodes each frame (JPEG or H.264) and drops the latest one into a
-//! shared slot, so a brief backlog collapses to the current frame instead of
-//! replaying stale ones. It also grabs mouse/keyboard input and forwards it as
-//! device-space messages.
+//! Render window and event-driven pipeline using winit and wgpu.
+//!
+//! Opens a native window sized from the first frame and streams video via a 2D GPU
+//! texture and fullscreen quad shader with PresentMode::Immediate.
+//! The network thread decodes frames and drops the latest one into a shared slot,
+//! notifying the event loop to request redraws. Keyboard and mouse inputs are captured
+//! and forwarded as device-space messages.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -11,12 +12,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use minifb::{MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
+use winit::{
+    application::ApplicationHandler,
+    dpi::{LogicalSize, PhysicalSize},
+    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key, ModifiersState, NamedKey, PhysicalKey},
+    window::{Window, WindowAttributes, WindowId},
+};
 
 use crate::clipboard;
 use crate::input::{map_to_norm, InputFrame};
-use crate::protocol::{self, KeyCode, MessageType, SystemAction, TouchPhase};
-use crate::sidebar;
+use crate::protocol::{self, KeyCode as ProtoKeyCode, MessageType, SystemAction, TouchPhase};
 use crate::video::DecodedFrame;
 
 /// Where the network thread drops the most recent decoded frame, alongside frame tracking stats.
@@ -25,12 +32,19 @@ pub struct FrameSlotInner {
     pub frame: Option<DecodedFrame>,
     pub incoming: u64,
     pub dropped: u64,
+    pub waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub type FrameSlot = Arc<Mutex<FrameSlotInner>>;
 
 pub fn new_frame_slot() -> FrameSlot {
     Arc::new(Mutex::new(FrameSlotInner::default()))
+}
+
+#[derive(Debug)]
+pub enum UserEvent {
+    NewFrame,
+    RemoteClipboard(String),
 }
 
 fn send_action(tx: &Sender<InputFrame>, action: SystemAction) {
@@ -40,14 +54,21 @@ fn send_action(tx: &Sender<InputFrame>, action: SystemAction) {
     ));
 }
 
-fn send_key(tx: &Sender<InputFrame>, code: protocol::KeyCode) {
+fn send_key(tx: &Sender<InputFrame>, code: ProtoKeyCode) {
     let _ = tx.send(InputFrame::new(
         MessageType::InputKey,
         protocol::encode_key(code),
     ));
 }
 
-/// Per-session clipboard bookkeeping, shared between the change poll and the Cmd+V
+fn send_touch(tx: &Sender<InputFrame>, phase: TouchPhase, x: f32, y: f32) {
+    let _ = tx.send(InputFrame::new(
+        MessageType::InputTouch,
+        protocol::encode_touch(phase, 0, x, y),
+    ));
+}
+
+/// Per-session clipboard bookkeeping, shared between the change poll and the Cmd/Ctrl+V
 /// handler. A change whose hash we already synced is just the echo of what the
 /// device gave us (or our own paste), so we don't re-send it.
 #[derive(Default)]
@@ -67,7 +88,7 @@ fn send_clipboard_set(tx: &Sender<InputFrame>, text: &str, paste: bool) {
 /// Push the host clipboard to the device then paste it, so cross-device paste
 /// carries the right text. Falls back to a plain iOS paste if the host
 /// clipboard isn't usable text (empty, too large, or no display). Shared by
-/// the Cmd/Ctrl+V shortcut and the sidebar Paste button.
+/// the Cmd/Ctrl+V shortcut.
 fn paste_now(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
     match clipboard::read_text() {
         Some(text) if !text.is_empty() && text.len() <= clipboard::MAX_CLIPBOARD_BYTES => {
@@ -76,29 +97,11 @@ fn paste_now(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
             }
             send_clipboard_set(tx, &text, true);
         }
-        _ => send_key(tx, KeyCode::Paste),
+        _ => send_key(tx, ProtoKeyCode::Paste),
     }
 }
 
-/// Translate a sidebar button press into the same messages its matching
-/// keyboard shortcut sends.
-fn dispatch_sidebar_action(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>, action: sidebar::Action) {
-    use sidebar::Action::*;
-    match action {
-        Home => send_action(tx, SystemAction::Home),
-        Lock => send_action(tx, SystemAction::Lock),
-        AppSwitcher => send_action(tx, SystemAction::AppSwitcher),
-        Rotate => send_action(tx, SystemAction::RotateLeft),
-        Back => send_action(tx, SystemAction::Back),
-        SelectAll => send_key(tx, KeyCode::SelectAll),
-        Copy => send_key(tx, KeyCode::Copy),
-        Paste => paste_now(tx, clip),
-        Cut => send_key(tx, KeyCode::Cut),
-        Undo => send_key(tx, KeyCode::Undo),
-    }
-}
-
-/// Put a clipboard value the device sent into the Mac pasteboard, recording the
+/// Put a clipboard value the device sent into the host pasteboard, recording the
 /// hash and change count so our own poll doesn't echo it back.
 fn apply_remote_clipboard(text: &str, clip: &Arc<Mutex<ClipState>>) {
     if text.is_empty() {
@@ -113,7 +116,7 @@ fn apply_remote_clipboard(text: &str, clip: &Arc<Mutex<ClipState>>) {
     st.last_change_count = clipboard::write_text(text);
 }
 
-/// If the Mac clipboard changed to new text, push it to the device.
+/// If the host clipboard changed to new text, push it to the device.
 fn poll_clipboard(tx: &Sender<InputFrame>, clip: &Arc<Mutex<ClipState>>) {
     let cc = clipboard::change_count();
     {
@@ -150,15 +153,15 @@ unsafe fn nsstring_to_string(ns: *mut objc::runtime::Object) -> String {
         .into_owned()
 }
 
-/// Capture the Mac keyboard and forward it to the device. minifb only implements
-/// `keyDown:`, and macOS routes Cmd+letter through `performKeyEquivalent:` which
-/// minifb never sees, so a local event monitor is the only way to reliably see
-/// every key-down. We sort each one out: Cmd+J/L/T/R are system actions,
-/// Cmd+A/C/V/X/Z are iOS editing shortcuts, Enter/Backspace/Tab/Esc/arrows are
-/// editing keys, everything else is text (the layout-resolved characters, so any
-/// keyboard layout already gave us the right glyph). Handled events are swallowed.
+/// Capture the Mac keyboard and forward it to the device via a local Cocoa monitor.
+/// Handled events return nil so they are not forwarded to Cocoa's default handler,
+/// preventing the system error alert beep on unhandled key equivalents.
 #[cfg(target_os = "macos")]
-fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>, fps_toggle: Arc<AtomicBool>) {
+fn install_key_monitor(
+    tx: Sender<InputFrame>,
+    clip: Arc<Mutex<ClipState>>,
+    fps_toggle: Arc<AtomicBool>,
+) {
     use block::ConcreteBlock;
     use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};
@@ -198,11 +201,11 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>, fps_
                                 println!("[ioscpy] FPS counter stopped");
                             }
                         }
-                        b'a' | b'A' => send_key(&tx, KeyCode::SelectAll),
-                        b'c' | b'C' => send_key(&tx, KeyCode::Copy),
+                        b'a' | b'A' => send_key(&tx, ProtoKeyCode::SelectAll),
+                        b'c' | b'C' => send_key(&tx, ProtoKeyCode::Copy),
                         b'v' | b'V' => paste_now(&tx, &clip),
-                        b'x' | b'X' => send_key(&tx, KeyCode::Cut),
-                        b'z' | b'Z' => send_key(&tx, KeyCode::Undo),
+                        b'x' | b'X' => send_key(&tx, ProtoKeyCode::Cut),
+                        b'z' | b'Z' => send_key(&tx, ProtoKeyCode::Undo),
                         _ => handled = false,
                     }
                     if handled {
@@ -220,13 +223,13 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>, fps_
                 return nil;
             }
             let special = match keycode {
-                36 | 76 => Some(KeyCode::Enter),
-                51 => Some(KeyCode::Backspace),
-                48 => Some(KeyCode::Tab),
-                123 => Some(KeyCode::Left),
-                124 => Some(KeyCode::Right),
-                125 => Some(KeyCode::Down),
-                126 => Some(KeyCode::Up),
+                36 | 76 => Some(ProtoKeyCode::Enter),
+                51 => Some(ProtoKeyCode::Backspace),
+                48 => Some(ProtoKeyCode::Tab),
+                123 => Some(ProtoKeyCode::Left),
+                124 => Some(ProtoKeyCode::Right),
+                125 => Some(ProtoKeyCode::Down),
+                126 => Some(ProtoKeyCode::Up),
                 _ => None,
             };
             if let Some(k) = special {
@@ -259,161 +262,11 @@ fn install_key_monitor(tx: Sender<InputFrame>, clip: Arc<Mutex<ClipState>>, fps_
 }
 
 #[cfg(not(target_os = "macos"))]
-fn install_key_monitor(_tx: Sender<InputFrame>, _clip: Arc<Mutex<ClipState>>, _fps_toggle: Arc<AtomicBool>) {}
-
-/// Forwards typed characters from minifb's input callback to the device as text.
-/// It tracks Ctrl from the same key-event stream (via `set_key_state`) and drops
-/// characters while Ctrl is held, so a shortcut like Ctrl+C isn't also typed. This
-/// is needed because minifb's backends disagree: X11 hands us a C0 control code for
-/// Ctrl+letter (caught by `is_control`), but Wayland resolves the bare keysym and
-/// hands us the plain letter, which `is_control` wouldn't catch.
-#[cfg(not(target_os = "macos"))]
-struct TextForwarder {
-    tx: Sender<InputFrame>,
-    ctrl: bool,
-}
-
-#[cfg(not(target_os = "macos"))]
-impl minifb::InputCallback for TextForwarder {
-    fn add_char(&mut self, uni_char: u32) {
-        if self.ctrl {
-            return;
-        }
-        if let Some(c) = char::from_u32(uni_char) {
-            if !c.is_control() {
-                let _ = self
-                    .tx
-                    .send(InputFrame::new(MessageType::InputText, protocol::encode_text(&c.to_string())));
-            }
-        }
-    }
-
-    fn set_key_state(&mut self, key: minifb::Key, state: bool) {
-        if matches!(key, minifb::Key::LeftCtrl | minifb::Key::RightCtrl) {
-            self.ctrl = state;
-        }
-    }
-}
-
-/// Register text-input forwarding on the window. minifb's callback is per-window,
-/// so this must run again after the window is recreated on rotation. macOS uses
-/// the global `install_key_monitor` instead, so there it's a no-op.
-#[cfg(not(target_os = "macos"))]
-fn attach_text_input(window: &mut Window, tx: &Sender<InputFrame>) {
-    window.set_input_callback(Box::new(TextForwarder {
-        tx: tx.clone(),
-        ctrl: false,
-    }));
-}
-
-#[cfg(target_os = "macos")]
-fn attach_text_input(_window: &mut Window, _tx: &Sender<InputFrame>) {}
-
-/// Poll this frame's keys and forward shortcuts and editing keys, mirroring the
-/// macOS monitor but with Ctrl as the modifier (macOS uses Cmd). Text itself goes
-/// through `TextForwarder`; here we handle Esc (back), Enter/Tab, the repeating
-/// Backspace/arrows, and the Ctrl combos. macOS routes all of this through
-/// `install_key_monitor`, so this is Linux/Windows only.
-#[cfg(not(target_os = "macos"))]
-fn pump_keys(
-    window: &Window,
-    tx: &Sender<InputFrame>,
-    clip: &Arc<Mutex<ClipState>>,
-    fps_toggle: &Arc<AtomicBool>,
+fn install_key_monitor(
+    _tx: Sender<InputFrame>,
+    _clip: Arc<Mutex<ClipState>>,
+    _fps_toggle: Arc<AtomicBool>,
 ) {
-    use minifb::{Key, KeyRepeat};
-
-    let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
-
-    // One-shot keys: shortcuts and the editing keys that shouldn't auto-repeat.
-    for key in window.get_keys_pressed(KeyRepeat::No) {
-        if ctrl {
-            match key {
-                Key::J => send_action(tx, SystemAction::Home),
-                Key::L => send_action(tx, SystemAction::Lock),
-                Key::T => send_action(tx, SystemAction::AppSwitcher),
-                Key::R => send_action(tx, SystemAction::RotateLeft),
-                Key::I => {
-                    let prev = fps_toggle.fetch_xor(true, Ordering::Relaxed);
-                    if !prev {
-                        println!("[ioscpy] FPS counter started");
-                    } else {
-                        println!("[ioscpy] FPS counter stopped");
-                    }
-                }
-                Key::A => send_key(tx, KeyCode::SelectAll),
-                Key::C => send_key(tx, KeyCode::Copy),
-                Key::V => paste_now(tx, clip),
-                Key::X => send_key(tx, KeyCode::Cut),
-                Key::Z => send_key(tx, KeyCode::Undo),
-                _ => {}
-            }
-        } else {
-            match key {
-                Key::Escape => send_action(tx, SystemAction::Back),
-                Key::Enter | Key::NumPadEnter => send_key(tx, KeyCode::Enter),
-                Key::Tab => send_key(tx, KeyCode::Tab),
-                _ => {}
-            }
-        }
-    }
-
-    // Repeating keys: held Backspace and arrows keep firing. On a key's first frame
-    // it shows up in both KeyRepeat::No and ::Yes, so these keys must stay out of the
-    // one-shot match above, or they'd fire twice that frame. Keep the two sets disjoint.
-    if !ctrl {
-        for key in window.get_keys_pressed(KeyRepeat::Yes) {
-            match key {
-                Key::Backspace => send_key(tx, KeyCode::Backspace),
-                Key::Left => send_key(tx, KeyCode::Left),
-                Key::Right => send_key(tx, KeyCode::Right),
-                Key::Up => send_key(tx, KeyCode::Up),
-                Key::Down => send_key(tx, KeyCode::Down),
-                _ => {}
-            }
-        }
-    }
-}
-
-/// Window size for a `w`x`h` device frame at the given scale, clamped to at most
-/// about 92% of the screen while keeping the aspect ratio. `sidebar_w` is a
-/// fixed-width budget (the button panel) added on top of the scaled content,
-/// not stretched with it; the returned width includes it.
-fn scaled_fit(w: usize, h: usize, scale: f32, sidebar_w: usize) -> (usize, usize) {
-    let (sw, sh) = screen_visible_size();
-    let (max_w, max_h) = (
-        ((sw * 0.92) as f32 - sidebar_w as f32).max(160.0),
-        (sh * 0.92) as f32,
-    );
-    let tw = w as f32 * scale;
-    let th = h as f32 * scale;
-    let clamp = (max_w / tw).min(max_h / th).min(1.0);
-    (
-        ((tw * clamp) as usize).max(160) + sidebar_w,
-        ((th * clamp) as usize).max(160),
-    )
-}
-
-/// Open a render window with the given content size. We recreate the window on
-/// rotation instead of resizing it, because minifb only updates its tracked size
-/// on a live user drag. A programmatic resize would leave the size (and so the
-/// rendering and touch mapping) stale.
-fn open_window(title: &str, w: usize, h: usize) -> Result<Window> {
-    let mut window = Window::new(
-        title,
-        w,
-        h,
-        WindowOptions {
-            resize: true,
-            // The buffer we present is already window-sized and letterboxed (see
-            // `scale_frame`), so Stretch blits it 1:1.
-            scale_mode: ScaleMode::Stretch,
-            ..WindowOptions::default()
-        },
-    )
-    .context("could not open the render window")?;
-    window.set_target_fps(60);
-    Ok(window)
 }
 
 /// Become a regular Dock app and set its icon (the icon is embedded in the
@@ -448,33 +301,6 @@ pub fn set_app_icon() {
 #[cfg(not(target_os = "macos"))]
 pub fn set_app_icon() {}
 
-/// The window's backing scale (2.0 on retina). minifb reports its size in points
-/// but samples with nearest-neighbor, so to stay sharp we scale our buffer up to
-/// the real backing pixel resolution.
-#[cfg(target_os = "macos")]
-fn backing_scale(window: &Window) -> f32 {
-    use objc::runtime::Object;
-    use objc::{msg_send, sel, sel_impl};
-    unsafe {
-        let handle = window.get_window_handle();
-        if handle.is_null() {
-            return 2.0;
-        }
-        let nswindow = handle as *mut Object;
-        let scale: f64 = msg_send![nswindow, backingScaleFactor];
-        if scale >= 1.0 {
-            scale as f32
-        } else {
-            2.0
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn backing_scale(_window: &Window) -> f32 {
-    1.0
-}
-
 /// The main screen's usable size in points (menu bar and dock excluded). Used to
 /// fit the window on screen. Otherwise macOS clamps an over-tall window's height
 /// and the device ends up letterboxed with side bars.
@@ -498,119 +324,821 @@ fn screen_visible_size() -> (f64, f64) {
     (1440.0, 900.0)
 }
 
-/// Bilinearly scale `src` into the `[0, content_w)` columns of `dst`, a
-/// `stride`-wide by `out_h`-tall buffer that also holds the sidebar past
-/// `content_w`. Keeps the device aspect ratio and centers it with black bars
-/// (letterbox) within that column range; `dst` must already be cleared to the
-/// letterbox color. minifb's `AspectRatioStretch` can't do this letterboxing
-/// for us, as its POSIX scaler shears the image when the buffer is taller
-/// than the window (it swaps width/height into `image_resize_linear_stride`),
-/// so we letterbox ourselves and blit the result 1:1 with `Stretch`.
-/// Precomputed horizontal sample positions and weights for faster scaling.
-struct XSample {
-    x0: usize,
-    x1: usize,
-    wx: u32,
+/// Window size for a `w`x`h` device frame at the given scale, clamped to at most
+/// about 92% of the screen while keeping the aspect ratio.
+fn scaled_fit(w: usize, h: usize, scale: f32) -> (usize, usize) {
+    let (sw, sh) = screen_visible_size();
+    let (max_w, max_h) = ((sw * 0.92) as f32, (sh * 0.92) as f32);
+    let tw = w as f32 * scale;
+    let th = h as f32 * scale;
+    let clamp = (max_w / tw).min(max_h / th).min(1.0);
+    (
+        ((tw * clamp) as usize).max(160),
+        ((th * clamp) as usize).max(160),
+    )
 }
 
-/// Bilinear blend of four `0x00RRGGBB` pixels using fixed-point integer math with
-/// independent color channels to prevent channel crosstalk or overflow.
-#[inline(always)]
-fn bilerp(p00: u32, p10: u32, p01: u32, p11: u32, wx: u32, wy: u32) -> u32 {
-    let inv_wx = 256 - wx;
-    let inv_wy = 256 - wy;
-    let w00 = inv_wx * inv_wy;
-    let w10 = wx * inv_wy;
-    let w01 = inv_wx * wy;
-    let w11 = wx * wy;
+const SHADER_SOURCE: &str = r#"
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+};
 
-    let r00 = (p00 >> 16) & 0xFF;
-    let r10 = (p10 >> 16) & 0xFF;
-    let r01 = (p01 >> 16) & 0xFF;
-    let r11 = (p11 >> 16) & 0xFF;
-    let r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) >> 16;
-
-    let g00 = (p00 >> 8) & 0xFF;
-    let g10 = (p10 >> 8) & 0xFF;
-    let g01 = (p01 >> 8) & 0xFF;
-    let g11 = (p11 >> 8) & 0xFF;
-    let g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) >> 16;
-
-    let b00 = p00 & 0xFF;
-    let b10 = p10 & 0xFF;
-    let b01 = p01 & 0xFF;
-    let b11 = p11 & 0xFF;
-    let b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) >> 16;
-
-    (r << 16) | (g << 8) | b
+@vertex
+fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+    var out: VertexOutput;
+    // Fullscreen triangle covering [-1, 1] NDC
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0)
+    );
+    let p = pos[in_vertex_index];
+    out.clip_position = vec4<f32>(p, 0.0, 1.0);
+    // NDC (-1, 1) -> (0, 0) top-left; NDC (1, -1) -> (1, 1) bottom-right
+    out.tex_coords = vec2<f32>((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+    return out;
 }
 
-/// Bilinearly scale `src` into the `[0, content_w)` columns of `dst`, a
-/// `stride`-wide by `out_h`-tall buffer that also holds the sidebar past
-/// `content_w`. Keeps the device aspect ratio and centers it with black bars
-/// (letterbox) within that column range; `dst` must already be cleared to the
-/// letterbox color. minifb's `AspectRatioStretch` can't do this letterboxing
-/// for us, as its POSIX scaler shears the image when the buffer is taller
-/// than the window (it swaps width/height into `image_resize_linear_stride`),
-/// so we letterbox ourselves and blit the result 1:1 with `Stretch`.
-fn scale_frame(src: &DecodedFrame, content_w: usize, out_h: usize, stride: usize, dst: &mut [u32]) {
-    let content_w = content_w.max(1);
-    let out_h = out_h.max(1);
+@group(0) @binding(0)
+var t_diffuse: texture_2d<f32>;
+@group(0) @binding(1)
+var s_diffuse: sampler;
 
-    let scale = (content_w as f32 / src.width as f32).min(out_h as f32 / src.height as f32);
-    let dw = ((src.width as f32 * scale) as usize).clamp(1, content_w);
-    let dh = ((src.height as f32 * scale) as usize).clamp(1, out_h);
-    let x_off = (content_w - dw) / 2;
-    let y_off = (out_h - dh) / 2;
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(t_diffuse, s_diffuse, in.tex_coords);
+    return vec4<f32>(color.rgb, 1.0);
+}
+"#;
 
-    // 1:1 direct blit fast path
-    if dw == src.width && dh == src.height {
-        for y in 0..dh {
-            let srow = y * src.width;
-            let drow = (y + y_off) * stride + x_off;
-            dst[drow..drow + dw].copy_from_slice(&src.buf[srow..srow + dw]);
+struct WgpuRenderer {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    render_pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    texture: Option<wgpu::Texture>,
+    texture_view: Option<wgpu::TextureView>,
+    bind_group: Option<wgpu::BindGroup>,
+    texture_size: (u32, u32),
+}
+
+impl WgpuRenderer {
+    fn new(window: Arc<Window>, initial_frame: &DecodedFrame) -> Result<Self> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        let surface = instance.create_surface(window.clone())?;
+
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
+        .context("failed to find an appropriate GPU adapter")?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("ioscpy Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: Default::default(),
+            },
+            None,
+        ))
+        .context("failed to create GPU device")?;
+
+        let capabilities = surface.get_capabilities(&adapter);
+        let surface_format = capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(capabilities.formats[0]);
+
+        // Use PresentMode::Immediate for minimal latency as requested, falling back to
+        // Mailbox or Fifo if unsupported by the backend/compositor.
+        let present_mode = if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Immediate)
+        {
+            wgpu::PresentMode::Immediate
+        } else if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
+            wgpu::PresentMode::Mailbox
+        } else {
+            capabilities.present_modes[0]
+        };
+
+        let size = window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width,
+            height,
+            present_mode,
+            alpha_mode: capabilities.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 1,
+        };
+        surface.configure(&device, &config);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fullscreen Quad Shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Texture Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Linear Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let mut renderer = Self {
+            surface,
+            device,
+            queue,
+            config,
+            render_pipeline,
+            bind_group_layout,
+            sampler,
+            texture: None,
+            texture_view: None,
+            bind_group: None,
+            texture_size: (0, 0),
+        };
+
+        renderer.update_texture(initial_frame);
+        Ok(renderer)
+    }
+
+    fn resize(&mut self, new_size: PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.config.width = new_size.width;
+            self.config.height = new_size.height;
+            self.surface.configure(&self.device, &self.config);
         }
-        return;
     }
 
-    let inv_x = src.width as f32 / dw as f32;
-    let inv_y = src.height as f32 / dh as f32;
-    let last_x = src.width - 1;
-    let last_y = src.height - 1;
+    fn update_texture(&mut self, frame: &DecodedFrame) {
+        let width = frame.width as u32;
+        let height = frame.height as u32;
 
-    // Precalculate horizontal sample coordinates to avoid repeated math per row
-    let mut x_lut = Vec::with_capacity(dw);
-    for x in 0..dw {
-        let fx = ((x as f32 + 0.5) * inv_x - 0.5).max(0.0);
-        let x0 = (fx as usize).min(last_x);
-        let x1 = (x0 + 1).min(last_x);
-        let wx = ((fx - x0 as f32) * 256.0).round() as u32;
-        x_lut.push(XSample { x0, x1, wx });
-    }
+        if self.texture_size != (width, height) || self.texture.is_none() {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Mirror Frame Texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Mirror Frame Bind Group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.texture = Some(texture);
+            self.texture_view = Some(view);
+            self.bind_group = Some(bind_group);
+            self.texture_size = (width, height);
+        }
 
-    for y in 0..dh {
-        let fy = ((y as f32 + 0.5) * inv_y - 0.5).max(0.0);
-        let y0 = (fy as usize).min(last_y);
-        let y1 = (y0 + 1).min(last_y);
-        let wy = ((fy - y0 as f32) * 256.0).round() as u32;
-        let srow0 = y0 * src.width;
-        let srow1 = y1 * src.width;
-        let drow = (y + y_off) * stride + x_off;
-        for (x, sample) in x_lut.iter().enumerate() {
-            dst[drow + x] = bilerp(
-                src.buf[srow0 + sample.x0],
-                src.buf[srow0 + sample.x1],
-                src.buf[srow1 + sample.x0],
-                src.buf[srow1 + sample.x1],
-                sample.wx,
-                wy,
+        if let Some(texture) = &self.texture {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&frame.buf),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
             );
         }
+    }
+
+    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        if self.config.width == 0 || self.config.height == 0 {
+            return Ok(());
+        }
+
+        let output = self.surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            if let Some(bind_group) = &self.bind_group {
+                let ww = self.config.width as f32;
+                let wh = self.config.height as f32;
+                let fw = self.texture_size.0 as f32;
+                let fh = self.texture_size.1 as f32;
+
+                if fw > 0.0 && fh > 0.0 {
+                    let img_aspect = fw / fh;
+                    let win_aspect = ww / wh;
+
+                    let (img_w, img_h, x_off, y_off) = if win_aspect > img_aspect {
+                        let w = wh * img_aspect;
+                        (w, wh, (ww - w) / 2.0, 0.0)
+                    } else {
+                        let h = ww / img_aspect;
+                        (ww, h, 0.0, (wh - h) / 2.0)
+                    };
+
+                    render_pass.set_pipeline(&self.render_pipeline);
+                    render_pass.set_viewport(x_off, y_off, img_w, img_h, 0.0, 1.0);
+                    render_pass.set_bind_group(0, bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                }
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct InputState {
+    touching: bool,
+    last: (f32, f32),
+}
+
+struct App {
+    title: String,
+    frames: FrameSlot,
+    stop: Arc<AtomicBool>,
+    input_tx: Sender<InputFrame>,
+    clip: Arc<Mutex<ClipState>>,
+    fps_enabled: Arc<AtomicBool>,
+    display_scale: f32,
+
+    current_frame: DecodedFrame,
+    last_dims: (usize, usize),
+    input_state: InputState,
+    cursor_pos: (f32, f32),
+    modifiers: ModifiersState,
+
+    last_clip_poll: Instant,
+    rendered_frames: u64,
+    last_fps_instant: Instant,
+    last_rendered_count: u64,
+    last_dropped_count: u64,
+    last_fps_was_enabled: bool,
+
+    window: Option<Arc<Window>>,
+    renderer: Option<WgpuRenderer>,
+}
+
+impl App {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        title: String,
+        frames: FrameSlot,
+        stop: Arc<AtomicBool>,
+        input_tx: Sender<InputFrame>,
+        clip: Arc<Mutex<ClipState>>,
+        fps_enabled: Arc<AtomicBool>,
+        display_scale: f32,
+        first_frame: DecodedFrame,
+    ) -> Self {
+        let print_fps = fps_enabled.load(Ordering::Relaxed);
+        let last_dims = (first_frame.width, first_frame.height);
+        Self {
+            title,
+            frames,
+            stop,
+            input_tx,
+            clip,
+            fps_enabled,
+            display_scale,
+            current_frame: first_frame,
+            last_dims,
+            input_state: InputState::default(),
+            cursor_pos: (0.0, 0.0),
+            modifiers: ModifiersState::default(),
+            last_clip_poll: Instant::now(),
+            rendered_frames: 0,
+            last_fps_instant: Instant::now(),
+            last_rendered_count: 0,
+            last_dropped_count: 0,
+            last_fps_was_enabled: print_fps,
+            window: None,
+            renderer: None,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn handle_key_input(&mut self, event: KeyEvent) {
+        if !event.state.is_pressed() {
+            return;
+        }
+
+        let ctrl = self.modifiers.control_key();
+
+        if ctrl {
+            let mut handled = true;
+            match &event.logical_key {
+                Key::Character(s) => match s.as_str() {
+                    "j" | "J" => send_action(&self.input_tx, SystemAction::Home),
+                    "l" | "L" => send_action(&self.input_tx, SystemAction::Lock),
+                    "t" | "T" => send_action(&self.input_tx, SystemAction::AppSwitcher),
+                    "r" | "R" => send_action(&self.input_tx, SystemAction::RotateLeft),
+                    "i" | "I" => {
+                        let prev = self.fps_enabled.fetch_xor(true, Ordering::Relaxed);
+                        if !prev {
+                            println!("[ioscpy] FPS counter started");
+                        } else {
+                            println!("[ioscpy] FPS counter stopped");
+                        }
+                    }
+                    "a" | "A" => send_key(&self.input_tx, ProtoKeyCode::SelectAll),
+                    "c" | "C" => send_key(&self.input_tx, ProtoKeyCode::Copy),
+                    "v" | "V" => paste_now(&self.input_tx, &self.clip),
+                    "x" | "X" => send_key(&self.input_tx, ProtoKeyCode::Cut),
+                    "z" | "Z" => send_key(&self.input_tx, ProtoKeyCode::Undo),
+                    _ => handled = false,
+                },
+                _ => handled = false,
+            }
+            if !handled {
+                // Fallback check physical key code
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    use winit::keyboard::KeyCode as WinitKeyCode;
+                    match code {
+                        WinitKeyCode::KeyJ => send_action(&self.input_tx, SystemAction::Home),
+                        WinitKeyCode::KeyL => send_action(&self.input_tx, SystemAction::Lock),
+                        WinitKeyCode::KeyT => {
+                            send_action(&self.input_tx, SystemAction::AppSwitcher)
+                        }
+                        WinitKeyCode::KeyR => send_action(&self.input_tx, SystemAction::RotateLeft),
+                        WinitKeyCode::KeyI => {
+                            let prev = self.fps_enabled.fetch_xor(true, Ordering::Relaxed);
+                            if !prev {
+                                println!("[ioscpy] FPS counter started");
+                            } else {
+                                println!("[ioscpy] FPS counter stopped");
+                            }
+                        }
+                        WinitKeyCode::KeyA => send_key(&self.input_tx, ProtoKeyCode::SelectAll),
+                        WinitKeyCode::KeyC => send_key(&self.input_tx, ProtoKeyCode::Copy),
+                        WinitKeyCode::KeyV => paste_now(&self.input_tx, &self.clip),
+                        WinitKeyCode::KeyX => send_key(&self.input_tx, ProtoKeyCode::Cut),
+                        WinitKeyCode::KeyZ => send_key(&self.input_tx, ProtoKeyCode::Undo),
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
+
+        // Non-Ctrl keys: editing keys and text
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                send_action(&self.input_tx, SystemAction::Back);
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                send_key(&self.input_tx, ProtoKeyCode::Enter);
+                return;
+            }
+            Key::Named(NamedKey::Tab) => {
+                send_key(&self.input_tx, ProtoKeyCode::Tab);
+                return;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                send_key(&self.input_tx, ProtoKeyCode::Backspace);
+                return;
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                send_key(&self.input_tx, ProtoKeyCode::Left);
+                return;
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                send_key(&self.input_tx, ProtoKeyCode::Right);
+                return;
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                send_key(&self.input_tx, ProtoKeyCode::Up);
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                send_key(&self.input_tx, ProtoKeyCode::Down);
+                return;
+            }
+            _ => {}
+        }
+
+        if let Some(text) = event.text {
+            if !text.is_empty() && !text.chars().all(char::is_control) {
+                let _ = self.input_tx.send(InputFrame::new(
+                    MessageType::InputText,
+                    protocol::encode_text(text.as_str()),
+                ));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_key_input(&mut self, _event: KeyEvent) {
+        // macOS routes keys through install_key_monitor (Cocoa local event monitor)
+        // to properly swallow handled shortcuts and prevent the system alert beep.
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let (win_w, win_h) = scaled_fit(
+            self.current_frame.width,
+            self.current_frame.height,
+            self.display_scale,
+        );
+
+        let window_attributes = WindowAttributes::default()
+            .with_title(&self.title)
+            .with_inner_size(LogicalSize::new(win_w as f64, win_h as f64));
+
+        let window = match event_loop.create_window(window_attributes) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                eprintln!("ioscpy: error creating window: {e:#}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        match WgpuRenderer::new(window.clone(), &self.current_frame) {
+            Ok(renderer) => {
+                self.window = Some(window);
+                self.renderer = Some(renderer);
+            }
+            Err(e) => {
+                eprintln!("ioscpy: error initializing wgpu: {e:#}");
+                event_loop.exit();
+                return;
+            }
+        }
+
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::NewFrame => {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            UserEvent::RemoteClipboard(text) => {
+                apply_remote_clipboard(&text, &self.clip);
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.stop.store(true, Ordering::Relaxed);
+                event_loop.exit();
+            }
+            WindowEvent::Resized(new_size) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(new_size);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(w) = &self.window {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.resize(w.inner_size());
+                    }
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if self.stop.load(Ordering::Relaxed) {
+                    event_loop.exit();
+                    return;
+                }
+
+                // Drain any fresh decoded frame from the slot
+                let (new_frame, _incoming_total, dropped_total) = {
+                    let mut lock = self.frames.lock().unwrap();
+                    (lock.frame.take(), lock.incoming, lock.dropped)
+                };
+
+                if let Some(decoded) = new_frame {
+                    self.current_frame = decoded;
+                    self.rendered_frames += 1;
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.update_texture(&self.current_frame);
+                    }
+                }
+
+                // Check for device orientation change and request window resize
+                let cur_dims = (self.current_frame.width, self.current_frame.height);
+                if cur_dims != self.last_dims {
+                    self.last_dims = cur_dims;
+                    let (nw, nh) = scaled_fit(cur_dims.0, cur_dims.1, self.display_scale);
+                    if let Some(w) = &self.window {
+                        let _ = w.request_inner_size(LogicalSize::new(nw as f64, nh as f64));
+                    }
+                }
+
+                // FPS tracking
+                let is_fps_on = self.fps_enabled.load(Ordering::Relaxed);
+                if self.last_fps_was_enabled && !is_fps_on {
+                    if let Some(w) = &self.window {
+                        w.set_title(&self.title);
+                    }
+                }
+                self.last_fps_was_enabled = is_fps_on;
+
+                if self.last_fps_instant.elapsed() >= Duration::from_secs(1) {
+                    let elapsed = self.last_fps_instant.elapsed().as_secs_f64();
+                    let rendered_delta = self.rendered_frames - self.last_rendered_count;
+                    let dropped_delta = dropped_total - self.last_dropped_count;
+                    self.last_rendered_count = self.rendered_frames;
+                    self.last_dropped_count = dropped_total;
+                    self.last_fps_instant = Instant::now();
+
+                    let fps = rendered_delta as f64 / elapsed;
+
+                    if is_fps_on {
+                        if dropped_delta > 0 {
+                            println!("{:.1} fps (+{} frames dropped)", fps, dropped_delta);
+                            if let Some(w) = &self.window {
+                                w.set_title(&format!(
+                                    "{} ({:.1} fps, {} dropped)",
+                                    self.title, fps, dropped_delta
+                                ));
+                            }
+                        } else {
+                            println!("{:.1} fps", fps);
+                            if let Some(w) = &self.window {
+                                w.set_title(&format!("{} ({:.1} fps)", self.title, fps));
+                            }
+                        }
+                    }
+                }
+
+                if let Some(renderer) = &mut self.renderer {
+                    match renderer.render() {
+                        Ok(()) => {}
+                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                            if let Some(w) = &self.window {
+                                renderer.resize(w.inner_size());
+                            }
+                        }
+                        Err(wgpu::SurfaceError::OutOfMemory) => {
+                            eprintln!("ioscpy: wgpu out of memory");
+                            event_loop.exit();
+                        }
+                        Err(wgpu::SurfaceError::Timeout | wgpu::SurfaceError::Other) => {}
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x as f32, position.y as f32);
+                if self.input_state.touching {
+                    if let Some(renderer) = &self.renderer {
+                        let win_w = renderer.config.width as usize;
+                        let win_h = renderer.config.height as usize;
+                        let (nx, ny) = map_to_norm(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            self.current_frame.width,
+                            self.current_frame.height,
+                        );
+                        if (nx - self.input_state.last.0).abs() > 0.001
+                            || (ny - self.input_state.last.1).abs() > 0.001
+                        {
+                            send_touch(&self.input_tx, TouchPhase::Move, nx, ny);
+                            self.input_state.last = (nx, ny);
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => {
+                    if let Some(renderer) = &self.renderer {
+                        let win_w = renderer.config.width as usize;
+                        let win_h = renderer.config.height as usize;
+                        let (nx, ny) = map_to_norm(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            self.current_frame.width,
+                            self.current_frame.height,
+                        );
+                        send_touch(&self.input_tx, TouchPhase::Down, nx, ny);
+                        self.input_state.touching = true;
+                        self.input_state.last = (nx, ny);
+                    }
+                }
+                ElementState::Released => {
+                    if self.input_state.touching {
+                        send_touch(
+                            &self.input_tx,
+                            TouchPhase::Up,
+                            self.input_state.last.0,
+                            self.input_state.last.1,
+                        );
+                        self.input_state.touching = false;
+                    }
+                }
+            },
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.handle_key_input(event);
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.stop.load(Ordering::Relaxed) {
+            event_loop.exit();
+            return;
+        }
+
+        // Push host clipboard changes to the device (rate-limited)
+        if self.last_clip_poll.elapsed() >= Duration::from_millis(300) {
+            self.last_clip_poll = Instant::now();
+            poll_clipboard(&self.input_tx, &self.clip);
+        }
+
+        // Check if a new frame is waiting in the slot
+        let has_pending_frame = {
+            let lock = self.frames.lock().unwrap();
+            lock.frame.is_some()
+        };
+        if has_pending_frame {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+
+        // Event-driven wait: wake up on events or after 50ms for clipboard poll
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(50),
+        ));
     }
 }
 
 /// Run the window loop on the calling (main) thread until the window closes or
-/// `stop` is set. Blits the latest frame and forwards input each iteration.
+/// `stop` is set. Renders the latest frame via wgpu and forwards input.
 pub fn run_window(
     title: &str,
     frames: FrameSlot,
@@ -624,234 +1152,58 @@ pub fn run_window(
         None => return Ok(()), // stopped before the first frame arrived
     };
 
-    // Compute the scale from the device's intrinsic size (long and short sides)
-    // so it's the same whatever orientation we launch in. A landscape-first launch
-    // must size the same as portrait-then-landscape.
     let (sw, sh) = screen_visible_size();
     let (sw, sh) = (sw as f32, sh as f32);
     let long = first.width.max(first.height).max(1) as f32;
     let short = first.width.min(first.height).max(1) as f32;
     let display_scale = ((sh * 0.92) / long).min((sw * 0.92) / short);
-    // Size the first window exactly as a rotation to this shape would.
-    let (win_w, win_h) = scaled_fit(first.width, first.height, display_scale, sidebar::WIDTH);
-    let mut window = open_window(title, win_w, win_h)?;
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+
+    // Attach waker to frame slot so incoming frames wake up the winit event loop
+    {
+        let p = proxy.clone();
+        let mut lock = frames.lock().unwrap();
+        lock.waker = Some(Arc::new(move || {
+            let _ = p.send_event(UserEvent::NewFrame);
+        }));
+    }
+
+    // Forward remote clipboard changes to the event loop
+    {
+        let p = proxy.clone();
+        std::thread::spawn(move || {
+            while let Ok(text) = clip_in.recv() {
+                if p.send_event(UserEvent::RemoteClipboard(text)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     let clip = Arc::new(Mutex::new(ClipState::default()));
     let fps_enabled = Arc::new(AtomicBool::new(print_fps));
     if print_fps {
         println!("[ioscpy] FPS counter started");
     }
+
     install_key_monitor(input_tx.clone(), clip.clone(), fps_enabled.clone());
-    attach_text_input(&mut window, &input_tx);
 
-    let mut current = first;
-    let mut last_dims = (current.width, current.height);
-    let mut input = InputState::default();
-    let mut combined: Vec<u32> = Vec::new();
-    let mut last_clip_poll = Instant::now();
+    let mut app = App::new(
+        title.to_string(),
+        frames,
+        stop.clone(),
+        input_tx,
+        clip,
+        fps_enabled,
+        display_scale,
+        first,
+    );
 
-    let mut rendered_frames = 0u64;
-    let mut last_fps_instant = Instant::now();
-    let mut last_rendered_count = 0u64;
-    let mut last_dropped_count = 0u64;
-    let mut last_fps_was_enabled = print_fps;
-    let mut dirty = true;
-
-    while window.is_open() && !stop.load(Ordering::Relaxed) {
-        // Take the newest decoded frame, and read dropped stats
-        let (new_frame, _incoming_total, dropped_total) = {
-            let mut lock = frames.lock().unwrap();
-            (lock.frame.take(), lock.incoming, lock.dropped)
-        };
-
-        if let Some(decoded) = new_frame {
-            current = decoded;
-            dirty = true;
-            rendered_frames += 1;
-        }
-
-        let is_fps_on = fps_enabled.load(Ordering::Relaxed);
-        if last_fps_was_enabled && !is_fps_on {
-            window.set_title(title);
-        }
-        last_fps_was_enabled = is_fps_on;
-
-        if last_fps_instant.elapsed() >= Duration::from_secs(1) {
-            let elapsed = last_fps_instant.elapsed().as_secs_f64();
-            let rendered_delta = rendered_frames - last_rendered_count;
-            let dropped_delta = dropped_total - last_dropped_count;
-            last_rendered_count = rendered_frames;
-            last_dropped_count = dropped_total;
-            last_fps_instant = Instant::now();
-
-            let fps = rendered_delta as f64 / elapsed;
-
-            if is_fps_on {
-                if dropped_delta > 0 {
-                    println!("{:.1} fps (+{} frames dropped)", fps, dropped_delta);
-                    window.set_title(&format!("{title} ({:.1} fps, {} dropped)", fps, dropped_delta));
-                } else {
-                    println!("{:.1} fps", fps);
-                    window.set_title(&format!("{title} ({:.1} fps)", fps));
-                }
-            }
-        }
-
-        // If the frame's shape flipped the phone rotated. Reopen the window at the
-        // new size, keeping its place. minifb won't track a programmatic resize, so
-        // recreating it is the reliable way to follow the rotation.
-        if (current.width, current.height) != last_dims {
-            last_dims = (current.width, current.height);
-            let (nw, nh) = scaled_fit(current.width, current.height, display_scale, sidebar::WIDTH);
-            let pos = window.get_position();
-            if let Ok(mut w) = open_window(title, nw, nh) {
-                w.set_position(pos.0, pos.1);
-                attach_text_input(&mut w, &input_tx);
-                window = w;
-            }
-            dirty = true;
-        }
-
-        // Window points: the sidebar is a fixed-width strip on the right, the
-        // device frame and touch mapping get whatever's left.
-        let (gw, gh) = window.get_size();
-        let content_w = gw.saturating_sub(sidebar::WIDTH).max(1);
-
-        let input_ctx = InputCtx { content_w, win_h: gh, tx: &input_tx, clip: &clip };
-        let prev_sidebar_down = input.sidebar_down;
-        pump_input(&window, &current, &mut input, &input_ctx);
-        #[cfg(not(target_os = "macos"))]
-        pump_keys(&window, &input_tx, &clip, &fps_enabled);
-        let sidebar_changed = prev_sidebar_down != input.sidebar_down;
-
-        // Render a window-sized, letterboxed buffer at the backing (retina)
-        // resolution for minifb to blit 1:1. Both axes are capped together so a
-        // huge window keeps its aspect (and per-frame cost bounded) under Stretch.
-        // Content and sidebar are written directly into one shared buffer, side
-        // by side, instead of composing separate buffers and copying them
-        // together every frame.
-        let bs = backing_scale(&window);
-        let ow = (content_w as f32 * bs).max(1.0);
-        let oh = (gh as f32 * bs).max(1.0);
-        let down = (2600.0 / (ow + sidebar::WIDTH as f32 * bs)).min(2600.0 / oh).min(1.0);
-        let content_px = ((ow * down) as usize).max(1);
-        let total_h = ((oh * down) as usize).max(1);
-        let sb_px = ((sidebar::WIDTH as f32 * bs * down).round() as usize).max(1);
-        let stride = content_px + sb_px;
-
-        if combined.len() != stride * total_h {
-            combined.resize(stride * total_h, 0);
-            dirty = true;
-        }
-
-        if dirty {
-            combined.fill(0);
-            scale_frame(&current, content_px, total_h, stride, &mut combined);
-            sidebar::draw_into(&mut combined, stride, content_px, sb_px, total_h, input.sidebar_down);
-            dirty = false;
-        } else if sidebar_changed {
-            sidebar::draw_into(&mut combined, stride, content_px, sb_px, total_h, input.sidebar_down);
-        }
-
-        window
-            .update_with_buffer(&combined, stride, total_h)
-            .context("failed to present a frame")?;
-
-        // Push Mac clipboard changes to the device (rate-limited).
-        if last_clip_poll.elapsed() >= Duration::from_millis(300) {
-            last_clip_poll = Instant::now();
-            poll_clipboard(&input_tx, &clip);
-        }
-        // Apply iPhone to Mac clipboard changes here on the main thread.
-        while let Ok(text) = clip_in.try_recv() {
-            apply_remote_clipboard(&text, &clip);
-        }
-    }
-
+    event_loop.run_app(&mut app)?;
     stop.store(true, Ordering::Relaxed);
     Ok(())
-}
-
-#[derive(Default)]
-struct InputState {
-    touching: bool,
-    last: (f32, f32),
-    /// Index of the sidebar button the press started on, while still held.
-    sidebar_down: Option<usize>,
-}
-
-/// Per-frame input collaborators, bundled so `pump_input` and its helpers
-/// stay under the 4-parameter line instead of threading five separate
-/// references through each call.
-struct InputCtx<'a> {
-    /// Window points excluding the sidebar; touch coordinates are mapped
-    /// against this so the button panel never counts as part of the device
-    /// screen.
-    content_w: usize,
-    win_h: usize,
-    tx: &'a Sender<InputFrame>,
-    clip: &'a Arc<Mutex<ClipState>>,
-}
-
-/// Turn this frame's mouse state into touch messages, or, for a press that
-/// starts in the sidebar strip, a button action. Keyboard shortcuts are
-/// handled separately by the event monitor.
-fn pump_input(window: &Window, frame: &DecodedFrame, state: &mut InputState, ctx: &InputCtx) {
-    let down = window.get_mouse_down(MouseButton::Left);
-
-    if !down {
-        if state.touching {
-            // Button released: always lift, using the last known position, even if
-            // the cursor is now outside the window (a fast swipe can release out
-            // there). Skip this and a phantom finger stays down on the device,
-            // which then ignores every later touch until something resets it.
-            send_touch(ctx.tx, TouchPhase::Up, state.last.0, state.last.1);
-            state.touching = false;
-        }
-        state.sidebar_down = None;
-        return;
-    }
-
-    let Some(pos) = window.get_mouse_pos(MouseMode::Clamp) else {
-        return;
-    };
-
-    if state.touching {
-        let (nx, ny) = map_to_norm(pos.0, pos.1, ctx.content_w, ctx.win_h, frame.width, frame.height);
-        if (nx - state.last.0).abs() > 0.001 || (ny - state.last.1).abs() > 0.001 {
-            // Only emit a move when the position actually changes.
-            send_touch(ctx.tx, TouchPhase::Move, nx, ny);
-        }
-        state.last = (nx, ny);
-        return;
-    }
-
-    if state.sidebar_down.is_some() {
-        return; // press started on a button; ignore drag until release
-    }
-
-    handle_fresh_press(pos, frame, state, ctx);
-}
-
-/// A press that wasn't already tracked as a touch or a held button: route it
-/// to a touch-down or a sidebar button depending on where it landed.
-fn handle_fresh_press(pos: (f32, f32), frame: &DecodedFrame, state: &mut InputState, ctx: &InputCtx) {
-    let (mx, my) = pos;
-    if (mx as usize) < ctx.content_w {
-        let (nx, ny) = map_to_norm(mx, my, ctx.content_w, ctx.win_h, frame.width, frame.height);
-        send_touch(ctx.tx, TouchPhase::Down, nx, ny);
-        state.touching = true;
-        state.last = (nx, ny);
-    } else if let Some(idx) = sidebar::hit_test(mx - ctx.content_w as f32, my, ctx.win_h as f32) {
-        state.sidebar_down = Some(idx);
-        dispatch_sidebar_action(ctx.tx, ctx.clip, sidebar::BUTTONS[idx]);
-    }
-}
-
-fn send_touch(tx: &Sender<InputFrame>, phase: TouchPhase, x: f32, y: f32) {
-    let _ = tx.send(InputFrame::new(
-        MessageType::InputTouch,
-        protocol::encode_touch(phase, 0, x, y),
-    ));
 }
 
 fn wait_for_first_frame(frames: &FrameSlot, stop: &Arc<AtomicBool>) -> Option<DecodedFrame> {

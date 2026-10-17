@@ -174,6 +174,9 @@ pub fn run_session(
                                     }
                                     lock.frame = Some(f);
                                     lock.incoming += 1;
+                                    if let Some(waker) = &lock.waker {
+                                        waker();
+                                    }
                                 }
                             }
                         }

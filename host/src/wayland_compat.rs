@@ -1,16 +1,14 @@
 //! Workaround for compositors without server-side decorations (issue #4).
 //!
-//! minifb's Wayland backend requests decorations via `zxdg_decoration_manager_v1`
-//! and has no client-side fallback, so on compositors that refuse server-side
-//! decorations (GNOME/mutter) the window comes up with no titlebar, no resize
-//! handles and no close button. KDE/KWin and wlroots compositors advertise the
-//! protocol and are fine.
+//! On compositors that refuse server-side decorations (GNOME/mutter) some
+//! backends come up with no titlebar, no resize handles and no close button.
+//! KDE/KWin and wlroots compositors advertise the protocol and are fine.
 //!
 //! Instead of asking users to run `WAYLAND_DISPLAY= ioscpy`, we probe the
 //! compositor's global registry once at startup: if it does not advertise
 //! `zxdg_decoration_manager_v1`, we unset `WAYLAND_DISPLAY` for this process so
-//! minifb (and the clipboard) fall back to X11/XWayland, which decorates the
-//! window normally. `--wayland` opts out and keeps the native connection.
+//! the window falls back to X11/XWayland, which decorates the window normally.
+//! `--wayland` opts out and keeps the native connection.
 
 use wayland_client::{
     protocol::wl_registry::{Event as RegistryEvent, WlRegistry},
@@ -41,8 +39,8 @@ impl Dispatch<WlRegistry, ()> for Probe {
 }
 
 /// True if the compositor advertises server-side decorations, None if we could
-/// not talk to it at all (then we leave the environment alone and let minifb
-/// surface whatever error there is).
+/// not talk to it at all (then we leave the environment alone and let the window
+/// system surface whatever error there is).
 fn compositor_has_server_decorations() -> Option<bool> {
     let conn = Connection::connect_to_env().ok()?;
     let display = conn.display();
@@ -67,7 +65,7 @@ fn env_set(name: &str) -> bool {
 pub fn apply_decoration_workaround(keep_native_wayland: bool) {
     // WAYLAND_SOCKET (an inherited connection fd) takes precedence over
     // WAYLAND_DISPLAY in libwayland and wayland-client alike, so either one
-    // means minifb would connect to Wayland.
+    // means we would connect to Wayland.
     if !env_set("WAYLAND_DISPLAY") && !env_set("WAYLAND_SOCKET") {
         return; // not a Wayland session (or already masked by the user)
     }

@@ -164,7 +164,14 @@ fn cmd_connect(cli: &Cli) -> Result<()> {
     });
 
     let window_title = format!("ioscpy v{HOST_VERSION}");
-    let result = window::run_window(&window_title, slot, stop.clone(), input_tx, clip_in_rx, cli.print_fps);
+    let result = window::run_window(
+        &window_title,
+        slot,
+        stop.clone(),
+        input_tx,
+        clip_in_rx,
+        cli.print_fps,
+    );
     stop.store(true, Ordering::Relaxed);
     let _ = net.join();
     result
