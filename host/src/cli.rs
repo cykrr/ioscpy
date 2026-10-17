@@ -73,9 +73,8 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", hide = true)]
     pub snapshot: Option<String>,
 
-    /// Stream for N seconds with no window and report fps / bandwidth / decode
-    /// time. For measuring stream performance.
-    #[arg(long, value_name = "SECONDS", hide = true)]
+    /// Benchmark stream performance (fps, wire latency, decode time, jitter) for N seconds without opening a window.
+    #[arg(long, value_name = "SECONDS")]
     pub bench: Option<u64>,
 
     /// Send one SYSTEM_ACTION code (1=Home 2=Lock 3=Wake 4=AppSwitcher) and report

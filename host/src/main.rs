@@ -25,6 +25,8 @@ mod video;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod wayland_compat;
 mod window;
+#[cfg(test)]
+mod benchmarks;
 
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -370,7 +372,29 @@ fn cmd_snapshot(cli: &Cli, port: u16, path: &str) -> Result<()> {
     }
 }
 
-/// Stream for `secs` seconds with no window and print the numbers.
+struct BenchStats {
+    min: f64,
+    avg: f64,
+    p50: f64,
+    p95: f64,
+    max: f64,
+}
+
+fn calc_bench_stats(mut samples: Vec<f64>) -> Option<BenchStats> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let len = samples.len();
+    let min = samples[0];
+    let max = samples[len - 1];
+    let avg = samples.iter().sum::<f64>() / len as f64;
+    let p50 = samples[len * 50 / 100];
+    let p95 = samples[(len * 95 / 100).min(len - 1)];
+    Some(BenchStats { min, avg, p50, p95, max })
+}
+
+/// Stream for `secs` seconds with no window and print a detailed benchmark report.
 fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     let mut forward: Option<usbmux::UsbForward> = None;
     let mut stream = establish(cli, port, &mut forward)?;
@@ -416,16 +440,28 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     let window = Duration::from_secs(secs);
     let (mut frames, mut bytes, mut decoded, mut h264_frames, mut keyframes) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
-    let mut decode_total = Duration::ZERO;
-    let mut read_total = Duration::ZERO;
     let (mut w, mut h) = (0u32, 0u32);
     let mut h264_dec: Option<h264::H264Decoder> = None;
+
+    let mut read_samples = Vec::new();
+    let mut decode_samples = Vec::new();
+    let mut interval_samples = Vec::new();
+    let mut last_frame_instant: Option<Instant> = None;
+    let mut device_perf_logs: Vec<String> = Vec::new();
 
     while start.elapsed() < window {
         let rt = Instant::now();
         let frame = protocol::read_frame(&mut stream)?;
-        read_total += rt.elapsed();
+        let read_ms = rt.elapsed().as_secs_f64() * 1000.0;
+
         if frame.message_type() == Some(protocol::MessageType::VideoFrame) {
+            read_samples.push(read_ms);
+            let now = Instant::now();
+            if let Some(prev) = last_frame_instant {
+                interval_samples.push((now - prev).as_secs_f64() * 1000.0);
+            }
+            last_frame_instant = Some(now);
+
             if let Some((fw, fh, flags, data)) = protocol::parse_video_payload(&frame.payload) {
                 frames += 1;
                 bytes += data.len() as u64;
@@ -435,26 +471,29 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
                     if flags & protocol::VIDEO_FLAG_KEYFRAME != 0 {
                         keyframes += 1;
                     }
-                    // Run the real VideoToolbox decode so we exercise the whole
-                    // pipeline, and time it.
                     if h264_dec.is_none() {
                         h264_dec = h264::H264Decoder::new();
                     }
                     if let Some(d) = h264_dec.as_mut() {
-                        let t = Instant::now();
+                        let dt = Instant::now();
                         if let h264::Decoded::Frame(f) = d.decode(data) {
-                            decode_total += t.elapsed();
+                            decode_samples.push(dt.elapsed().as_secs_f64() * 1000.0);
                             decoded += 1;
                             (w, h) = (f.width as u32, f.height as u32);
                         }
                     }
                 } else {
-                    // MJPEG frame: decode to check it's valid and time it.
-                    let t = Instant::now();
+                    let dt = Instant::now();
                     if video::decode_jpeg(data).is_some() {
-                        decode_total += t.elapsed();
+                        decode_samples.push(dt.elapsed().as_secs_f64() * 1000.0);
                         decoded += 1;
                     }
+                }
+            }
+        } else if frame.message_type() == Some(protocol::MessageType::Log) {
+            if let Ok(log) = serde_json::from_slice::<protocol::LogMessage>(&frame.payload) {
+                if log.level == "perf" {
+                    device_perf_logs.push(log.message);
                 }
             }
         }
@@ -470,25 +509,35 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
     let elapsed = start.elapsed().as_secs_f64();
     let n = frames.max(1) as f64;
     let kind = if h264_frames > 0 { "h264" } else { "mjpeg" };
-    println!(
-        "bench: {frames} {kind} frames in {elapsed:.1}s = {:.1} fps",
-        frames as f64 / elapsed
-    );
-    println!(
-        "  {w}x{h}, avg {:.1} KB/frame, ~{:.2} MB/s over the wire",
-        bytes as f64 / n / 1024.0,
-        bytes as f64 / elapsed / 1024.0 / 1024.0
-    );
-    if h264_frames > 0 {
-        println!("  h264: {h264_frames} frames, {keyframes} keyframes");
+    let fps = frames as f64 / elapsed;
+
+    println!("\n============================== BENCHMARK REPORT ==============================");
+    println!("  Stream:       {kind} ({w}x{h})");
+    println!("  Duration:     {elapsed:.2}s | Received: {frames} frames ({decoded} decoded, {keyframes} keyframes)");
+    println!("  Framerate:    {fps:.2} FPS");
+    println!("  Bitrate:      {:.2} Mbps (~{:.1} KB/frame, {:.2} MB/s wire)",
+             (bytes as f64 * 8.0) / (elapsed * 1_000_000.0),
+             bytes as f64 / n / 1024.0,
+             bytes as f64 / elapsed / (1024.0 * 1024.0));
+    println!("\n  --- Latency Distributions (milliseconds) -----------------------------------");
+    println!("  {: <18} {: >8} {: >8} {: >8} {: >8} {: >8}", "Metric", "Min", "Avg", "P50", "P95", "Max");
+    println!("  {:-<18} {:-<8} {:-<8} {:-<8} {:-<8} {:-<8}", "", "", "", "", "", "");
+    if let Some(s) = calc_bench_stats(interval_samples) {
+        println!("  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}", "Frame Interval", s.min, s.avg, s.p50, s.p95, s.max);
     }
-    if decoded > 0 {
-        println!(
-            "  read {:.1} ms/frame, host decode {:.1} ms/frame",
-            read_total.as_secs_f64() * 1000.0 / n,
-            decode_total.as_secs_f64() * 1000.0 / decoded as f64
-        );
+    if let Some(s) = calc_bench_stats(read_samples) {
+        println!("  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}", "Network Read", s.min, s.avg, s.p50, s.p95, s.max);
     }
+    if let Some(s) = calc_bench_stats(decode_samples) {
+        println!("  {: <18} {: >8.2} {: >8.2} {: >8.2} {: >8.2} {: >8.2}", "Host Decode", s.min, s.avg, s.p50, s.p95, s.max);
+    }
+    if !device_perf_logs.is_empty() {
+        println!("\n  --- Device Pipeline Telemetry (reported by iPhone) -----------------------");
+        for log in device_perf_logs.iter().rev().take(3).rev() {
+            println!("  [device perf] {log}");
+        }
+    }
+    println!("==============================================================================\n");
     Ok(())
 }
 

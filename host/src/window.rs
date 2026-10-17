@@ -24,6 +24,7 @@ use winit::{
 use crate::clipboard;
 use crate::input::{map_to_norm, InputFrame};
 use crate::protocol::{self, KeyCode as ProtoKeyCode, MessageType, SystemAction, TouchPhase};
+use crate::sidebar;
 use crate::video::DecodedFrame;
 
 /// Where the network thread drops the most recent decoded frame, alongside frame tracking stats.
@@ -66,6 +67,28 @@ fn send_touch(tx: &Sender<InputFrame>, phase: TouchPhase, x: f32, y: f32) {
         MessageType::InputTouch,
         protocol::encode_touch(phase, 0, x, y),
     ));
+}
+
+/// Translate a sidebar button press into the same messages its matching
+/// keyboard shortcut sends.
+fn dispatch_sidebar_action(
+    tx: &Sender<InputFrame>,
+    clip: &Arc<Mutex<ClipState>>,
+    action: sidebar::Action,
+) {
+    use sidebar::Action::*;
+    match action {
+        Home => send_action(tx, SystemAction::Home),
+        Lock => send_action(tx, SystemAction::Lock),
+        AppSwitcher => send_action(tx, SystemAction::AppSwitcher),
+        Rotate => send_action(tx, SystemAction::RotateLeft),
+        Back => send_action(tx, SystemAction::Back),
+        SelectAll => send_key(tx, ProtoKeyCode::SelectAll),
+        Copy => send_key(tx, ProtoKeyCode::Copy),
+        Paste => paste_now(tx, clip),
+        Cut => send_key(tx, ProtoKeyCode::Cut),
+        Undo => send_key(tx, ProtoKeyCode::Undo),
+    }
 }
 
 /// Per-session clipboard bookkeeping, shared between the change poll and the Cmd/Ctrl+V
@@ -325,15 +348,19 @@ fn screen_visible_size() -> (f64, f64) {
 }
 
 /// Window size for a `w`x`h` device frame at the given scale, clamped to at most
-/// about 92% of the screen while keeping the aspect ratio.
-fn scaled_fit(w: usize, h: usize, scale: f32) -> (usize, usize) {
+/// about 92% of the screen while keeping the aspect ratio. `sidebar_w` is a
+/// fixed-width budget added to the window width.
+fn scaled_fit(w: usize, h: usize, scale: f32, sidebar_w: usize) -> (usize, usize) {
     let (sw, sh) = screen_visible_size();
-    let (max_w, max_h) = ((sw * 0.92) as f32, (sh * 0.92) as f32);
+    let (max_w, max_h) = (
+        ((sw * 0.92) as f32 - sidebar_w as f32).max(160.0),
+        (sh * 0.92) as f32,
+    );
     let tw = w as f32 * scale;
     let th = h as f32 * scale;
     let clamp = (max_w / tw).min(max_h / th).min(1.0);
     (
-        ((tw * clamp) as usize).max(160),
+        ((tw * clamp) as usize).max(160) + sidebar_w,
         ((th * clamp) as usize).max(160),
     )
 }
@@ -377,13 +404,23 @@ struct WgpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    texture_format: wgpu::TextureFormat,
     render_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+
+    // Mirror frame texture
     texture: Option<wgpu::Texture>,
     texture_view: Option<wgpu::TextureView>,
     bind_group: Option<wgpu::BindGroup>,
     texture_size: (u32, u32),
+
+    // Sidebar button strip texture
+    sidebar_texture: Option<wgpu::Texture>,
+    sidebar_texture_view: Option<wgpu::TextureView>,
+    sidebar_bind_group: Option<wgpu::BindGroup>,
+    sidebar_size: (u32, u32),
+    sidebar_buf: Vec<u32>,
 }
 
 impl WgpuRenderer {
@@ -414,12 +451,24 @@ impl WgpuRenderer {
         .context("failed to create GPU device")?;
 
         let capabilities = surface.get_capabilities(&adapter);
+
+        // Prefer a non-sRGB surface format if available so the decoded video
+        // frame values pass straight through 1:1 without double-gamma conversion.
+        // If the surface only supports sRGB (e.g. some Wayland/Metal compositors),
+        // we use an sRGB texture format so the GPU hardware sRGB -> linear -> sRGB
+        // roundtrip cancels out and preserves the original video contrast.
         let surface_format = capabilities
             .formats
             .iter()
             .copied()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .unwrap_or(capabilities.formats[0]);
+
+        let texture_format = if surface_format.is_srgb() {
+            wgpu::TextureFormat::Bgra8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Bgra8Unorm
+        };
 
         // Use PresentMode::Immediate for minimal latency as requested, falling back to
         // Mailbox or Fifo if unsupported by the backend/compositor.
@@ -540,6 +589,7 @@ impl WgpuRenderer {
             device,
             queue,
             config,
+            texture_format,
             render_pipeline,
             bind_group_layout,
             sampler,
@@ -547,6 +597,11 @@ impl WgpuRenderer {
             texture_view: None,
             bind_group: None,
             texture_size: (0, 0),
+            sidebar_texture: None,
+            sidebar_texture_view: None,
+            sidebar_bind_group: None,
+            sidebar_size: (0, 0),
+            sidebar_buf: Vec::new(),
         };
 
         renderer.update_texture(initial_frame);
@@ -576,7 +631,7 @@ impl WgpuRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
+                format: self.texture_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -624,7 +679,80 @@ impl WgpuRenderer {
         }
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    fn update_sidebar(&mut self, width: u32, height: u32, pressed: Option<usize>) {
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let w = width as usize;
+        let h = height as usize;
+        let needed = w * h;
+        if self.sidebar_buf.len() != needed {
+            self.sidebar_buf.resize(needed, 0);
+        }
+
+        sidebar::draw_into(&mut self.sidebar_buf, w, 0, w, h, pressed);
+
+        if self.sidebar_size != (width, height) || self.sidebar_texture.is_none() {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Sidebar Texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.texture_format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Sidebar Bind Group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.sidebar_texture = Some(texture);
+            self.sidebar_texture_view = Some(view);
+            self.sidebar_bind_group = Some(bind_group);
+            self.sidebar_size = (width, height);
+        }
+
+        if let Some(texture) = &self.sidebar_texture {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&self.sidebar_buf),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    fn render(&mut self, scale_factor: f32) -> Result<(), wgpu::SurfaceError> {
         if self.config.width == 0 || self.config.height == 0 {
             return Ok(());
         }
@@ -638,6 +766,12 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
+
+        let sidebar_w_px = (sidebar::WIDTH as f32 * scale_factor)
+            .round()
+            .min(self.config.width as f32);
+        let content_w_px = (self.config.width as f32 - sidebar_w_px).max(1.0);
+        let gh = self.config.height as f32;
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -655,27 +789,36 @@ impl WgpuRenderer {
                 occlusion_query_set: None,
             });
 
+            // 1. Draw the mirror frame into its letterboxed area on the left
             if let Some(bind_group) = &self.bind_group {
-                let ww = self.config.width as f32;
-                let wh = self.config.height as f32;
                 let fw = self.texture_size.0 as f32;
                 let fh = self.texture_size.1 as f32;
 
                 if fw > 0.0 && fh > 0.0 {
                     let img_aspect = fw / fh;
-                    let win_aspect = ww / wh;
+                    let area_aspect = content_w_px / gh;
 
-                    let (img_w, img_h, x_off, y_off) = if win_aspect > img_aspect {
-                        let w = wh * img_aspect;
-                        (w, wh, (ww - w) / 2.0, 0.0)
+                    let (img_w, img_h, x_off, y_off) = if area_aspect > img_aspect {
+                        let w = gh * img_aspect;
+                        (w, gh, (content_w_px - w) / 2.0, 0.0)
                     } else {
-                        let h = ww / img_aspect;
-                        (ww, h, 0.0, (wh - h) / 2.0)
+                        let h = content_w_px / img_aspect;
+                        (content_w_px, h, 0.0, (gh - h) / 2.0)
                     };
 
                     render_pass.set_pipeline(&self.render_pipeline);
                     render_pass.set_viewport(x_off, y_off, img_w, img_h, 0.0, 1.0);
                     render_pass.set_bind_group(0, bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                }
+            }
+
+            // 2. Draw the sidebar into its strip on the right
+            if sidebar_w_px > 0.0 {
+                if let Some(sb_bind_group) = &self.sidebar_bind_group {
+                    render_pass.set_pipeline(&self.render_pipeline);
+                    render_pass.set_viewport(content_w_px, 0.0, sidebar_w_px, gh, 0.0, 1.0);
+                    render_pass.set_bind_group(0, sb_bind_group, &[]);
                     render_pass.draw(0..3, 0..1);
                 }
             }
@@ -691,6 +834,7 @@ impl WgpuRenderer {
 struct InputState {
     touching: bool,
     last: (f32, f32),
+    sidebar_down: Option<usize>,
 }
 
 struct App {
@@ -754,6 +898,22 @@ impl App {
             last_fps_was_enabled: print_fps,
             window: None,
             renderer: None,
+        }
+    }
+
+    fn scale_factor(&self) -> f32 {
+        self.window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0)
+    }
+
+    fn update_sidebar_texture(&mut self, pressed: Option<usize>) {
+        let scale_factor = self.scale_factor();
+        if let Some(renderer) = &mut self.renderer {
+            let sidebar_w_px = (sidebar::WIDTH as f32 * scale_factor).round() as u32;
+            let h = renderer.config.height;
+            renderer.update_sidebar(sidebar_w_px, h, pressed);
         }
     }
 
@@ -885,6 +1045,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.current_frame.width,
             self.current_frame.height,
             self.display_scale,
+            sidebar::WIDTH,
         );
 
         let window_attributes = WindowAttributes::default()
@@ -904,6 +1065,7 @@ impl ApplicationHandler<UserEvent> for App {
             Ok(renderer) => {
                 self.window = Some(window);
                 self.renderer = Some(renderer);
+                self.update_sidebar_texture(None);
             }
             Err(e) => {
                 eprintln!("ioscpy: error initializing wgpu: {e:#}");
@@ -945,15 +1107,20 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(new_size);
                 }
+                self.update_sidebar_texture(self.input_state.sidebar_down);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(w) = &self.window {
+                let size = self.window.as_ref().map(|w| w.inner_size());
+                if let Some(size) = size {
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.resize(w.inner_size());
+                        renderer.resize(size);
                     }
+                }
+                self.update_sidebar_texture(self.input_state.sidebar_down);
+                if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
@@ -981,7 +1148,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let cur_dims = (self.current_frame.width, self.current_frame.height);
                 if cur_dims != self.last_dims {
                     self.last_dims = cur_dims;
-                    let (nw, nh) = scaled_fit(cur_dims.0, cur_dims.1, self.display_scale);
+                    let (nw, nh) = scaled_fit(
+                        cur_dims.0,
+                        cur_dims.1,
+                        self.display_scale,
+                        sidebar::WIDTH,
+                    );
                     if let Some(w) = &self.window {
                         let _ = w.request_inner_size(LogicalSize::new(nw as f64, nh as f64));
                     }
@@ -1024,8 +1196,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                let scale_factor = self.scale_factor();
                 if let Some(renderer) = &mut self.renderer {
-                    match renderer.render() {
+                    match renderer.render(scale_factor) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             if let Some(w) = &self.window {
@@ -1044,21 +1217,33 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cursor_pos = (position.x as f32, position.y as f32);
                 if self.input_state.touching {
                     if let Some(renderer) = &self.renderer {
-                        let win_w = renderer.config.width as usize;
-                        let win_h = renderer.config.height as usize;
-                        let (nx, ny) = map_to_norm(
-                            self.cursor_pos.0,
-                            self.cursor_pos.1,
-                            win_w,
-                            win_h,
-                            self.current_frame.width,
-                            self.current_frame.height,
-                        );
-                        if (nx - self.input_state.last.0).abs() > 0.001
-                            || (ny - self.input_state.last.1).abs() > 0.001
-                        {
-                            send_touch(&self.input_tx, TouchPhase::Move, nx, ny);
-                            self.input_state.last = (nx, ny);
+                        let scale_factor = self.scale_factor();
+                        let sidebar_w_px = (sidebar::WIDTH as f32 * scale_factor)
+                            .round()
+                            .min(renderer.config.width as f32);
+                        let content_w_px = (renderer.config.width as f32 - sidebar_w_px).max(1.0);
+                        let gh = renderer.config.height as f32;
+
+                        let fw = self.current_frame.width as f32;
+                        let fh = self.current_frame.height as f32;
+                        if fw > 0.0 && fh > 0.0 {
+                            let img_aspect = fw / fh;
+                            let area_aspect = content_w_px / gh;
+                            let (img_w, img_h, x_off, y_off) = if area_aspect > img_aspect {
+                                let w = gh * img_aspect;
+                                (w, gh, (content_w_px - w) / 2.0, 0.0)
+                            } else {
+                                let h = content_w_px / img_aspect;
+                                (content_w_px, h, 0.0, (gh - h) / 2.0)
+                            };
+
+                            let nx = ((self.cursor_pos.0 - x_off) / img_w).clamp(0.0, 1.0);
+                            let ny = ((self.cursor_pos.1 - y_off) / img_h).clamp(0.0, 1.0);
+
+                            if nx != self.input_state.last.0 || ny != self.input_state.last.1 {
+                                send_touch(&self.input_tx, TouchPhase::Move, nx, ny);
+                                self.input_state.last = (nx, ny);
+                            }
                         }
                     }
                 }
@@ -1070,19 +1255,61 @@ impl ApplicationHandler<UserEvent> for App {
             } => match state {
                 ElementState::Pressed => {
                     if let Some(renderer) = &self.renderer {
-                        let win_w = renderer.config.width as usize;
-                        let win_h = renderer.config.height as usize;
-                        let (nx, ny) = map_to_norm(
-                            self.cursor_pos.0,
-                            self.cursor_pos.1,
-                            win_w,
-                            win_h,
-                            self.current_frame.width,
-                            self.current_frame.height,
-                        );
-                        send_touch(&self.input_tx, TouchPhase::Down, nx, ny);
-                        self.input_state.touching = true;
-                        self.input_state.last = (nx, ny);
+                        let scale_factor = self.scale_factor();
+                        let sidebar_w_px = (sidebar::WIDTH as f32 * scale_factor)
+                            .round()
+                            .min(renderer.config.width as f32);
+                        let content_w_px = (renderer.config.width as f32 - sidebar_w_px).max(1.0);
+                        let gh = renderer.config.height as f32;
+
+                        let mx = self.cursor_pos.0;
+                        let my = self.cursor_pos.1;
+
+                        if mx < content_w_px {
+                            // Touch event on mirror screen
+                            let fw = self.current_frame.width as f32;
+                            let fh = self.current_frame.height as f32;
+                            if fw > 0.0 && fh > 0.0 {
+                                let img_aspect = fw / fh;
+                                let area_aspect = content_w_px / gh;
+                                let (img_w, img_h, x_off, y_off) = if area_aspect > img_aspect {
+                                    let w = gh * img_aspect;
+                                    (w, gh, (content_w_px - w) / 2.0, 0.0)
+                                } else {
+                                    let h = content_w_px / img_aspect;
+                                    (content_w_px, h, 0.0, (gh - h) / 2.0)
+                                };
+
+                                if mx >= x_off
+                                    && mx <= x_off + img_w
+                                    && my >= y_off
+                                    && my <= y_off + img_h
+                                {
+                                    let nx = ((mx - x_off) / img_w).clamp(0.0, 1.0);
+                                    let ny = ((my - y_off) / img_h).clamp(0.0, 1.0);
+                                    send_touch(&self.input_tx, TouchPhase::Down, nx, ny);
+                                    self.input_state.touching = true;
+                                    self.input_state.last = (nx, ny);
+                                }
+                            }
+                        } else if sidebar_w_px > 0.0 {
+                            // Click on sidebar button
+                            let sb_x = (mx - content_w_px) / scale_factor;
+                            let sb_y = my / scale_factor;
+                            let sb_h = gh / scale_factor;
+                            if let Some(idx) = sidebar::hit_test(sb_x, sb_y, sb_h) {
+                                self.input_state.sidebar_down = Some(idx);
+                                dispatch_sidebar_action(
+                                    &self.input_tx,
+                                    &self.clip,
+                                    sidebar::BUTTONS[idx],
+                                );
+                                self.update_sidebar_texture(Some(idx));
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                            }
+                        }
                     }
                 }
                 ElementState::Released => {
@@ -1094,6 +1321,12 @@ impl ApplicationHandler<UserEvent> for App {
                             self.input_state.last.1,
                         );
                         self.input_state.touching = false;
+                    }
+                    if self.input_state.sidebar_down.take().is_some() {
+                        self.update_sidebar_texture(None);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
                     }
                 }
             },
