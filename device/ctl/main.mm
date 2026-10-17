@@ -155,10 +155,90 @@ static int cmdExportDiagnostics(void) {
     return rc;
 }
 
+static int cmdBench(int seconds) {
+    if (seconds <= 0) seconds = 5;
+    printf("Starting on-device stream benchmark for %d seconds...\n", seconds);
+    int fd = connectLoopback(IOSPY_DEFAULT_PORT);
+    if (fd < 0) {
+        printf("Error: Could not connect to ioscpyd on 127.0.0.1:%d\n", IOSPY_DEFAULT_PORT);
+        return 1;
+    }
+    // Handshake
+    NSDictionary *hello = @{
+        @"role": @"ctl-bench",
+        @"host_version": @"0.1.5",
+        @"protocol_version": @(IOSPY_PROTOCOL_VERSION),
+        @"nonce": @"00",
+    };
+    NSData *body = [NSJSONSerialization dataWithJSONObject:hello options:0 error:nil];
+    if (!IOSPYWriteFrame(fd, IOSPYMsgHello, IOSPY_CHANNEL_CONTROL, 0, body)) {
+        printf("Error: Failed to send HELLO\n");
+        close(fd);
+        return 1;
+    }
+    IOSPYFrameHeader hdr;
+    NSData *payload = nil;
+    if (!IOSPYReadFrame(fd, &hdr, &payload) || hdr.type != IOSPYMsgHelloAck) {
+        printf("Error: Failed to receive HELLO_ACK\n");
+        close(fd);
+        return 1;
+    }
+    printf("Connected to daemon. Starting H.264 stream benchmark...\n");
+    uint8_t codec = IOSPY_VIDEO_CODEC_H264;
+    NSData *codecData = [NSData dataWithBytes:&codec length:1];
+    IOSPYWriteFrame(fd, IOSPYMsgStartStream, IOSPY_CHANNEL_CONTROL, 0, codecData);
+
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime lastFrameTime = start;
+    uint64_t frameCount = 0;
+    uint64_t totalBytes = 0;
+    double maxInterval = 0;
+    double minInterval = 999.0;
+
+    while (CFAbsoluteTimeGetCurrent() - start < seconds) {
+        if (!IOSPYReadFrame(fd, &hdr, &payload)) {
+            break;
+        }
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (hdr.type == IOSPYMsgVideoFrame && payload.length >= 16) {
+            frameCount++;
+            totalBytes += payload.length;
+            if (frameCount > 1) {
+                double interval = (now - lastFrameTime) * 1000.0;
+                if (interval > maxInterval) maxInterval = interval;
+                if (interval < minInterval) minInterval = interval;
+            }
+            lastFrameTime = now;
+        } else if (hdr.type == IOSPYMsgLog && payload.length > 0) {
+            NSDictionary *log = [NSJSONSerialization JSONObjectWithData:payload options:0 error:nil];
+            if (log) {
+                printf("  [device perf] %s\n", [log[@"message"] UTF8String]);
+            }
+        }
+    }
+    IOSPYWriteFrame(fd, IOSPYMsgStopStream, IOSPY_CHANNEL_CONTROL, 0, nil);
+    close(fd);
+
+    double totalElapsed = CFAbsoluteTimeGetCurrent() - start;
+    double fps = (double)frameCount / totalElapsed;
+    double mbps = (double)totalBytes * 8.0 / (totalElapsed * 1000000.0);
+    printf("\n=== Device Stream Benchmark Results ===\n");
+    printf("Duration:        %.2f s\n", totalElapsed);
+    printf("Frames captured: %llu\n", (unsigned long long)frameCount);
+    printf("Framerate:       %.2f FPS\n", fps);
+    printf("Bitrate:         %.2f Mbps (%.1f KB/frame)\n", mbps, frameCount ? (double)totalBytes / frameCount / 1024.0 : 0.0);
+    if (frameCount > 1) {
+        printf("Frame interval:  min=%.2f ms, avg=%.2f ms, max=%.2f ms\n", minInterval, 1000.0 / fps, maxInterval);
+    }
+    printf("=======================================\n");
+    return 0;
+}
+
 static void usage(void) {
     printf("usage: ioscpyctl <command>\n");
     printf("  status              device + daemon + tweak summary\n");
     printf("  capabilities        capability map reported by the daemon\n");
+    printf("  bench [seconds]     benchmark live capture & stream speed on device\n");
     printf("  print-device-info   jailbreak layout and device facts\n");
     printf("  restart-daemon      reload ioscpyd through launchd\n");
     printf("  reload-hooks        respring to reload the tweak\n");
@@ -177,6 +257,9 @@ int main(int argc, char *argv[]) {
             return cmdStatus();
         } else if ([cmd isEqualToString:@"capabilities"]) {
             return cmdCapabilities();
+        } else if ([cmd isEqualToString:@"bench"]) {
+            int secs = (argc >= 3) ? atoi(argv[2]) : 5;
+            return cmdBench(secs);
         } else if ([cmd isEqualToString:@"print-device-info"]) {
             printDeviceInfo();
             return 0;

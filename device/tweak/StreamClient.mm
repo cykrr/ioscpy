@@ -53,6 +53,13 @@ static uint64_t clipHash(NSString *t) {
     IOSPYH264Encoder *_encoder;    // created lazily on the capture queue
     uint8_t _codec;                // 0 = MJPEG, 1 = H.264 (host's request)
     BOOL _needKeyframe;            // force an H.264 keyframe on the next frame
+
+    // Telemetry & benchmarking
+    double _totalCaptureMs;
+    double _totalEncodeMs;
+    double _totalSendMs;
+    uint32_t _perfFrames;
+    CFAbsoluteTime _lastPerfLogTime;
 }
 
 + (instancetype)shared {
@@ -67,6 +74,7 @@ static uint64_t clipHash(NSString *t) {
 - (instancetype)init {
     if ((self = [super init])) {
         _fd = -1;
+        _lastPerfLogTime = CFAbsoluteTimeGetCurrent();
         dispatch_queue_attr_t qos = dispatch_queue_attr_make_with_qos_class(
             DISPATCH_QUEUE_SERIAL,
             QOS_CLASS_USER_INTERACTIVE,
@@ -364,6 +372,42 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                     makeVideoFrame(width, height, orientationFlags(), jpeg));
 }
 
+- (void)sendPerfLog:(NSString *)message {
+    NSDictionary *dict = @{@"level": @"perf", @"message": message};
+    NSData *body = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
+    if (body) {
+        int fd = self->_fd;
+        if (fd >= 0) {
+            IOSPYWriteFrame(fd, IOSPYMsgLog, IOSPY_CHANNEL_CONTROL, 0, body);
+        }
+    }
+}
+
+- (void)recordMetricsCapture:(double)capMs encode:(double)encMs send:(double)sndMs {
+    _totalCaptureMs += capMs;
+    _totalEncodeMs += encMs;
+    _totalSendMs += sndMs;
+    _perfFrames++;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    double elapsed = now - _lastPerfLogTime;
+    if (elapsed >= 1.0) {
+        double fps = (double)_perfFrames / elapsed;
+        double avgCap = _totalCaptureMs / _perfFrames;
+        double avgEnc = _totalEncodeMs / _perfFrames;
+        double avgSnd = _totalSendMs / _perfFrames;
+        NSString *report = [NSString stringWithFormat:@"fps=%.1f | capture=%.2fms encode=%.2fms send=%.2fms",
+                            fps, avgCap, avgEnc, avgSnd];
+        [self sendPerfLog:report];
+
+        _totalCaptureMs = 0;
+        _totalEncodeMs = 0;
+        _totalSendMs = 0;
+        _perfFrames = 0;
+        _lastPerfLogTime = now;
+    }
+}
+
 - (BOOL)captureAndSendH264:(int)fd {
     if (!IOSPYH264Available()) {
         return NO;
@@ -372,7 +416,9 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         _encoder = [[IOSPYH264Encoder alloc] init];
     }
     int width = 0, height = 0;
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     IOSurfaceRef surface = IOSPYCaptureScreenSurface(0, &width, &height);
+    double capMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
     if (!surface || width < 2 || height < 2) {
         return NO;
     }
@@ -385,6 +431,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         _needKeyframe = NO;
     }
 
+    CFAbsoluteTime tEncStart = CFAbsoluteTimeGetCurrent();
     __weak typeof(self) weakSelf = self;
     return [_encoder encodeSurface:surface
                              width:width
@@ -392,6 +439,7 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
                                fps:fps
                      forceKeyframe:forceKey
                            handler:^(NSData *avcc, BOOL isKey, BOOL failed) {
+        double encMs = (CFAbsoluteTimeGetCurrent() - tEncStart) * 1000.0;
         typeof(self) strongSelf = weakSelf;
         if (!strongSelf) {
             return;
@@ -413,7 +461,10 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
         dispatch_async(strongSelf->_captureQueue, ^{
             int currentFd = strongSelf->_fd;
             if (currentFd >= 0) {
+                CFAbsoluteTime tSndStart = CFAbsoluteTimeGetCurrent();
                 IOSPYWriteFrame(currentFd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0, frame);
+                double sndMs = (CFAbsoluteTimeGetCurrent() - tSndStart) * 1000.0;
+                [strongSelf recordMetricsCapture:capMs encode:encMs send:sndMs];
             }
         });
     }];

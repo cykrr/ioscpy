@@ -167,6 +167,19 @@
                                        payload);
                     [hostLock unlock];
                 }
+            } else if (header.type == IOSPYMsgLog) {
+                // Relay tweak->host performance/log messages on the control channel.
+                int hostFd;
+                NSLock *hostLock;
+                @synchronized(self) {
+                    hostFd = _hostFd;
+                    hostLock = _hostLock;
+                }
+                if (hostFd >= 0 && hostLock) {
+                    [hostLock lock];
+                    IOSPYTryWriteFrame(hostFd, IOSPYMsgLog, IOSPY_CHANNEL_CONTROL, 0, payload);
+                    [hostLock unlock];
+                }
             }
         }
     }
