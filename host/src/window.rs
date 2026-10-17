@@ -1148,12 +1148,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let cur_dims = (self.current_frame.width, self.current_frame.height);
                 if cur_dims != self.last_dims {
                     self.last_dims = cur_dims;
-                    let (nw, nh) = scaled_fit(
-                        cur_dims.0,
-                        cur_dims.1,
-                        self.display_scale,
-                        sidebar::WIDTH,
-                    );
+                    let (nw, nh) =
+                        scaled_fit(cur_dims.0, cur_dims.1, self.display_scale, sidebar::WIDTH);
                     if let Some(w) = &self.window {
                         let _ = w.request_inner_size(LogicalSize::new(nw as f64, nh as f64));
                     }
@@ -1224,21 +1220,17 @@ impl ApplicationHandler<UserEvent> for App {
                         let content_w_px = (renderer.config.width as f32 - sidebar_w_px).max(1.0);
                         let gh = renderer.config.height as f32;
 
-                        let fw = self.current_frame.width as f32;
-                        let fh = self.current_frame.height as f32;
-                        if fw > 0.0 && fh > 0.0 {
-                            let img_aspect = fw / fh;
-                            let area_aspect = content_w_px / gh;
-                            let (img_w, img_h, x_off, y_off) = if area_aspect > img_aspect {
-                                let w = gh * img_aspect;
-                                (w, gh, (content_w_px - w) / 2.0, 0.0)
-                            } else {
-                                let h = content_w_px / img_aspect;
-                                (content_w_px, h, 0.0, (gh - h) / 2.0)
-                            };
-
-                            let nx = ((self.cursor_pos.0 - x_off) / img_w).clamp(0.0, 1.0);
-                            let ny = ((self.cursor_pos.1 - y_off) / img_h).clamp(0.0, 1.0);
+                        let fw = self.current_frame.width;
+                        let fh = self.current_frame.height;
+                        if fw > 0 && fh > 0 {
+                            let (nx, ny) = map_to_norm(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                content_w_px as usize,
+                                gh as usize,
+                                fw,
+                                fh,
+                            );
 
                             if nx != self.input_state.last.0 || ny != self.input_state.last.1 {
                                 send_touch(&self.input_tx, TouchPhase::Move, nx, ny);
@@ -1285,8 +1277,14 @@ impl ApplicationHandler<UserEvent> for App {
                                     && my >= y_off
                                     && my <= y_off + img_h
                                 {
-                                    let nx = ((mx - x_off) / img_w).clamp(0.0, 1.0);
-                                    let ny = ((my - y_off) / img_h).clamp(0.0, 1.0);
+                                    let (nx, ny) = map_to_norm(
+                                        mx,
+                                        my,
+                                        content_w_px as usize,
+                                        gh as usize,
+                                        self.current_frame.width,
+                                        self.current_frame.height,
+                                    );
                                     send_touch(&self.input_tx, TouchPhase::Down, nx, ny);
                                     self.input_state.touching = true;
                                     self.input_state.last = (nx, ny);
