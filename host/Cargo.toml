@@ -68,5 +68,10 @@ opt-level = 3
 lto = "thin"
 strip = true
 
+# Optimize dependencies even in debug mode so software H.264 video decoding
+# can sustain 60 FPS without dropping frames or stalling sockets.
+[profile.dev.package."*"]
+opt-level = 3
+
 [lints.clippy]
 all = "warn"

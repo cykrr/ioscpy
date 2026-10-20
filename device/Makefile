@@ -7,3 +7,6 @@ include $(THEOS)/makefiles/common.mk
 SUBPROJECTS = daemon ctl tweak
 
 include $(THEOS)/makefiles/aggregate.mk
+
+after-install::
+	install.exec "sbreload 2>/dev/null || killall -9 SpringBoard"
