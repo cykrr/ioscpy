@@ -1009,7 +1009,23 @@ impl App {
 
     #[cfg(not(target_os = "macos"))]
     fn handle_key_input(&mut self, event: KeyEvent) {
-        if !event.state.is_pressed() {
+        self.process_key_event(
+            event.state,
+            &event.logical_key,
+            event.physical_key,
+            event.text.as_deref(),
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn process_key_event(
+        &mut self,
+        state: ElementState,
+        logical_key: &Key,
+        physical_key: PhysicalKey,
+        text: Option<&str>,
+    ) {
+        if !state.is_pressed() {
             return;
         }
 
@@ -1017,7 +1033,7 @@ impl App {
 
         if ctrl {
             let mut handled = true;
-            match &event.logical_key {
+            match logical_key {
                 Key::Character(s) => match s.as_str() {
                     "j" | "J" => send_action(&self.input_tx, SystemAction::Home),
                     "l" | "L" => send_action(&self.input_tx, SystemAction::Lock),
@@ -1042,7 +1058,7 @@ impl App {
             }
             if !handled {
                 // Fallback check physical key code
-                if let PhysicalKey::Code(code) = event.physical_key {
+                if let PhysicalKey::Code(code) = physical_key {
                     use winit::keyboard::KeyCode as WinitKeyCode;
                     match code {
                         WinitKeyCode::KeyJ => send_action(&self.input_tx, SystemAction::Home),
@@ -1072,7 +1088,7 @@ impl App {
         }
 
         // Non-Ctrl keys: editing keys and text
-        match &event.logical_key {
+        match logical_key {
             Key::Named(NamedKey::Escape) => {
                 send_action(&self.input_tx, SystemAction::Back);
                 return;
@@ -1087,6 +1103,20 @@ impl App {
             }
             Key::Named(NamedKey::Backspace) => {
                 send_key(&self.input_tx, ProtoKeyCode::Backspace);
+                return;
+            }
+            Key::Named(NamedKey::Space) => {
+                let _ = self.input_tx.send(InputFrame::new(
+                    MessageType::InputText,
+                    protocol::encode_text(" "),
+                ));
+                return;
+            }
+            Key::Character(s) if s == " " => {
+                let _ = self.input_tx.send(InputFrame::new(
+                    MessageType::InputText,
+                    protocol::encode_text(" "),
+                ));
                 return;
             }
             Key::Named(NamedKey::ArrowLeft) => {
@@ -1108,11 +1138,31 @@ impl App {
             _ => {}
         }
 
-        if let Some(text) = event.text {
-            if !text.is_empty() && !text.chars().all(char::is_control) {
+        // Fallback for physical space bar if logical_key wasn't resolved as Space
+        if let PhysicalKey::Code(winit::keyboard::KeyCode::Space) = physical_key {
+            let _ = self.input_tx.send(InputFrame::new(
+                MessageType::InputText,
+                protocol::encode_text(" "),
+            ));
+            return;
+        }
+
+        if let Some(t) = text {
+            if !t.is_empty() && !t.chars().all(char::is_control) {
                 let _ = self.input_tx.send(InputFrame::new(
                     MessageType::InputText,
-                    protocol::encode_text(text.as_str()),
+                    protocol::encode_text(t),
+                ));
+                return;
+            }
+        }
+
+        // Fallback to logical_key text representation if event.text is None
+        if let Some(t) = logical_key.to_text() {
+            if !t.is_empty() && !t.chars().all(char::is_control) {
+                let _ = self.input_tx.send(InputFrame::new(
+                    MessageType::InputText,
+                    protocol::encode_text(t),
                 ));
             }
         }
@@ -1585,4 +1635,95 @@ fn wait_for_first_frame(frames: &FrameSlot, stop: &Arc<AtomicBool>) -> Option<De
         std::thread::sleep(Duration::from_millis(20));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use winit::event::ElementState;
+    use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+
+    fn make_test_app() -> (App, mpsc::Receiver<InputFrame>) {
+        let (tx, rx) = mpsc::channel();
+        let app = App::new(
+            "test".to_string(),
+            Arc::new(Mutex::new(FrameSlotInner::default())),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            Arc::new(Mutex::new(ClipState::default())),
+            Arc::new(AtomicBool::new(false)),
+            1.0,
+            DecodedFrame {
+                width: 100,
+                height: 100,
+                buf: vec![0; 100 * 100],
+            },
+        );
+        (app, rx)
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn test_space_key_registered_via_named_key() {
+        let (mut app, rx) = make_test_app();
+        app.process_key_event(
+            ElementState::Pressed,
+            &Key::Named(NamedKey::Space),
+            PhysicalKey::Code(KeyCode::Space),
+            None,
+        );
+
+        let frame = rx.try_recv().expect("Space key should send an InputFrame");
+        assert_eq!(frame.msg_type, MessageType::InputText);
+        assert_eq!(frame.payload, b" ");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn test_space_key_registered_via_character() {
+        let (mut app, rx) = make_test_app();
+        app.process_key_event(
+            ElementState::Pressed,
+            &Key::Character(" ".into()),
+            PhysicalKey::Code(KeyCode::Space),
+            None,
+        );
+
+        let frame = rx.try_recv().expect("Space character should send an InputFrame");
+        assert_eq!(frame.msg_type, MessageType::InputText);
+        assert_eq!(frame.payload, b" ");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn test_space_key_registered_via_physical_fallback() {
+        let (mut app, rx) = make_test_app();
+        app.process_key_event(
+            ElementState::Pressed,
+            &Key::Unidentified(winit::keyboard::NativeKey::Unidentified),
+            PhysicalKey::Code(KeyCode::Space),
+            None,
+        );
+
+        let frame = rx.try_recv().expect("Physical space key should fallback and send an InputFrame");
+        assert_eq!(frame.msg_type, MessageType::InputText);
+        assert_eq!(frame.payload, b" ");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn test_regular_text_with_none_event_text_fallback() {
+        let (mut app, rx) = make_test_app();
+        app.process_key_event(
+            ElementState::Pressed,
+            &Key::Character("x".into()),
+            PhysicalKey::Code(KeyCode::KeyX),
+            None,
+        );
+
+        let frame = rx.try_recv().expect("Character should fallback to logical_key.to_text()");
+        assert_eq!(frame.msg_type, MessageType::InputText);
+        assert_eq!(frame.payload, b"x");
+    }
 }
