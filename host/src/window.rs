@@ -1025,6 +1025,14 @@ impl App {
         physical_key: PhysicalKey,
         text: Option<&str>,
     ) {
+        crate::debug!(
+            "key event: state={:?} logical={:?} physical={:?} text={:?}",
+            state,
+            logical_key,
+            physical_key,
+            text
+        );
+
         if !state.is_pressed() {
             return;
         }
@@ -1106,6 +1114,7 @@ impl App {
                 return;
             }
             Key::Named(NamedKey::Space) => {
+                crate::debug!("key handled: NamedKey::Space -> sending InputText ' '");
                 let _ = self.input_tx.send(InputFrame::new(
                     MessageType::InputText,
                     protocol::encode_text(" "),
@@ -1113,6 +1122,7 @@ impl App {
                 return;
             }
             Key::Character(s) if s == " " => {
+                crate::debug!("key handled: Character(' ') -> sending InputText ' '");
                 let _ = self.input_tx.send(InputFrame::new(
                     MessageType::InputText,
                     protocol::encode_text(" "),
@@ -1140,6 +1150,7 @@ impl App {
 
         // Fallback for physical space bar if logical_key wasn't resolved as Space
         if let PhysicalKey::Code(winit::keyboard::KeyCode::Space) = physical_key {
+            crate::debug!("key handled: PhysicalKey::Space fallback -> sending InputText ' '");
             let _ = self.input_tx.send(InputFrame::new(
                 MessageType::InputText,
                 protocol::encode_text(" "),
@@ -1149,6 +1160,7 @@ impl App {
 
         if let Some(t) = text {
             if !t.is_empty() && !t.chars().all(char::is_control) {
+                crate::debug!("key handled: text {:?} -> sending InputText", t);
                 let _ = self.input_tx.send(InputFrame::new(
                     MessageType::InputText,
                     protocol::encode_text(t),
@@ -1160,6 +1172,7 @@ impl App {
         // Fallback to logical_key text representation if event.text is None
         if let Some(t) = logical_key.to_text() {
             if !t.is_empty() && !t.chars().all(char::is_control) {
+                crate::debug!("key handled: logical_key.to_text() {:?} -> sending InputText", t);
                 let _ = self.input_tx.send(InputFrame::new(
                     MessageType::InputText,
                     protocol::encode_text(t),

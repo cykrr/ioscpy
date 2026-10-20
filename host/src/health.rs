@@ -267,6 +267,15 @@ pub fn run_session(
         if let Some(rx_in) = input_rx {
             let mut failed = false;
             while let Ok(frame) = rx_in.try_recv() {
+                if frame.msg_type == protocol::MessageType::InputText
+                    || frame.msg_type == protocol::MessageType::InputKey
+                {
+                    crate::debug!(
+                        "sending to phone: msg={:?} payload={:?}",
+                        frame.msg_type,
+                        frame.payload
+                    );
+                }
                 if protocol::write_frame(
                     &mut writer,
                     frame.msg_type,
