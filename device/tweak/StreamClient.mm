@@ -265,11 +265,13 @@ static uint64_t clipHash(NSString *t) {
             dispatch_async(dispatch_get_main_queue(), ^{ IOSPYSystemAction(action); });
         } else if (header.type == IOSPYMsgInputText && payload.length > 0) {
             NSString *text = [[NSString alloc] initWithData:payload encoding:NSUTF8StringEncoding];
+            NSLog(@"[ioscpyhook] MsgInputText: len=%lu text='%@'", (unsigned long)payload.length, text);
             if (text) {
                 IOSPYTypeText(text);
             }
         } else if (header.type == IOSPYMsgInputKey && payload.length >= 1) {
             uint8_t code = ((const uint8_t *)payload.bytes)[0];
+            NSLog(@"[ioscpyhook] MsgInputKey: code=%u", code);
             IOSPYKeyAction(code);
         } else if (header.type == IOSPYMsgClipboardSet && payload.length >= 1) {
             // [flags:u8][utf8 text]; flags bit0 = paste after set.

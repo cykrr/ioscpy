@@ -14,8 +14,11 @@ typedef uint32_t IOHIDEventField;
 typedef uint32_t IOOptionBits;
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+typedef struct __IOHIDServiceClient *IOHIDServiceClientRef;
 
 extern "C" {
+CFArrayRef IOHIDEventSystemClientCopyServices(IOHIDEventSystemClientRef client);
+uint64_t IOHIDServiceClientGetRegistryID(IOHIDServiceClientRef service);
 IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator, uint64_t timeStamp,
                                              IOHIDDigitizerTransducerType type, uint32_t index,
                                              uint32_t identity, uint32_t eventMask,
@@ -87,6 +90,22 @@ static void hidInit(void) {
     if (gMonitor) {
         IOHIDEventSystemClientRegisterEventCallback(gMonitor, (void *)senderCallback, NULL, NULL);
         IOHIDEventSystemClientScheduleWithRunLoop(gMonitor, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    }
+    if (gSenderID == 0) {
+        CFArrayRef services = IOHIDEventSystemClientCopyServices(gClient);
+        if (services) {
+            CFIndex count = CFArrayGetCount(services);
+            for (CFIndex i = 0; i < count; i++) {
+                IOHIDServiceClientRef s = (IOHIDServiceClientRef)CFArrayGetValueAtIndex(services, i);
+                uint64_t regID = IOHIDServiceClientGetRegistryID(s);
+                if (regID != 0) {
+                    gSenderID = regID;
+                    NSLog(@"[ioscpyhook] discovered service senderID 0x%llx", gSenderID);
+                    break;
+                }
+            }
+            CFRelease(services);
+        }
     }
 }
 
@@ -287,8 +306,10 @@ static void keyEvent(uint32_t usage, bool down) {
     if (!e) {
         return;
     }
-    // Keyboard events route best with NO sender id (the captured one belongs to
-    // the touch panel). Only set it if typing doesn't land during testing.
+    if (gSenderID != 0) {
+        IOHIDEventSetSenderID(e, gSenderID);
+    }
+    NSLog(@"[ioscpyhook] keyEvent: usage=0x%02x down=%d senderID=0x%llx", usage, down ? 1 : 0, gSenderID);
     IOHIDEventSystemClientDispatchEvent(gClient, e);
     CFRelease(e);
 }
@@ -299,6 +320,9 @@ static void typeUsage(uint32_t usage, bool shift) {
         keyEvent(kHIDUsage_LeftShift, true);
     }
     keyEvent(usage, true);
+    // Hold key for 15ms so iOS debouncing and UIKit predictive/candidate engine
+    // registers the stroke (especially for whitespace/spacebar 0x2C).
+    usleep(15000);
     keyEvent(usage, false);
     if (shift) {
         keyEvent(kHIDUsage_LeftShift, false);
@@ -367,6 +391,7 @@ void IOSPYTypeText(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
         hidInit();
         if (!gClient) {
+            NSLog(@"[ioscpyhook] hidInit failed: gClient is NULL");
             return;
         }
         NSUInteger n = text.length;
@@ -375,7 +400,10 @@ void IOSPYTypeText(NSString *text) {
             uint32_t usage = 0;
             bool shift = false;
             if (charToUsage(c, &usage, &shift)) {
+                NSLog(@"[ioscpyhook] typeUsage char '%c' (0x%02x) -> usage=0x%02x shift=%d", c, c, usage, shift ? 1 : 0);
                 typeUsage(usage, shift);
+            } else {
+                NSLog(@"[ioscpyhook] charToUsage returned false for char 0x%02x", c);
             }
             // Non-ASCII (accents, emoji) go through the clipboard-paste path.
         }
