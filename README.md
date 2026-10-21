@@ -210,7 +210,7 @@ build, confirm `nasm` is on `PATH`.
 - Typing: keystrokes go to the focused field, in any Mac keyboard layout. Accents
   and emoji go through the clipboard.
 - Esc: go back.
-- Cmd+J, Cmd+L, Cmd+T, Cmd+R: Home, Lock, App Switcher, Rotate.
+- Cmd+H (or Cmd+J), Cmd+L, Cmd+T, Cmd+R: Home, Lock, App Switcher, Rotate.
 - Cmd+I: Toggle FPS counter on/off in console and window title bar.
 - Cmd+A, Cmd+C, Cmd+V, Cmd+X, Cmd+Z: Select All, Copy, Paste, Cut, Undo. The
   clipboard syncs both ways, so Cmd+C on the phone reaches the Mac.

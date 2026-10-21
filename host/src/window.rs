@@ -1043,7 +1043,7 @@ impl App {
             let mut handled = true;
             match logical_key {
                 Key::Character(s) => match s.as_str() {
-                    "j" | "J" => send_action(&self.input_tx, SystemAction::Home),
+                    "h" | "H" | "j" | "J" => send_action(&self.input_tx, SystemAction::Home),
                     "l" | "L" => send_action(&self.input_tx, SystemAction::Lock),
                     "t" | "T" => send_action(&self.input_tx, SystemAction::AppSwitcher),
                     "r" | "R" => send_action(&self.input_tx, SystemAction::RotateLeft),
@@ -1069,7 +1069,9 @@ impl App {
                 if let PhysicalKey::Code(code) = physical_key {
                     use winit::keyboard::KeyCode as WinitKeyCode;
                     match code {
-                        WinitKeyCode::KeyJ => send_action(&self.input_tx, SystemAction::Home),
+                        WinitKeyCode::KeyH | WinitKeyCode::KeyJ => {
+                            send_action(&self.input_tx, SystemAction::Home)
+                        }
                         WinitKeyCode::KeyL => send_action(&self.input_tx, SystemAction::Lock),
                         WinitKeyCode::KeyT => {
                             send_action(&self.input_tx, SystemAction::AppSwitcher)
