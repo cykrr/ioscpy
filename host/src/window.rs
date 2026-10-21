@@ -212,7 +212,7 @@ fn install_key_monitor(
                     let ch: u16 = msg_send![chars, characterAtIndex: 0u64];
                     let mut handled = true;
                     match ch as u8 {
-                        b'j' | b'J' => send_action(&tx, SystemAction::Home),
+                        b'h' | b'H' | b'j' | b'J' => send_action(&tx, SystemAction::Home),
                         b'l' | b'L' => send_action(&tx, SystemAction::Lock),
                         b't' | b'T' => send_action(&tx, SystemAction::AppSwitcher),
                         b'r' | b'R' => send_action(&tx, SystemAction::RotateLeft),
@@ -427,16 +427,26 @@ fn scaled_fit(w: usize, h: usize, scale: f32, sidebar_w: usize) -> (usize, usize
     )
 }
 
-const SHADER_SOURCE: &str = r#"
+const SHADER_RGBA: &str = r#"
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coords: vec2<f32>,
 };
 
+struct FrameParams {
+    turns: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var t_diffuse: texture_2d<f32>;
+@group(0) @binding(1) var s_diffuse: sampler;
+@group(0) @binding(2) var<uniform> params: FrameParams;
+
 @vertex
 fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     var out: VertexOutput;
-    // Fullscreen triangle covering [-1, 1] NDC
     var pos = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0),
         vec2<f32>(3.0, -1.0),
@@ -444,15 +454,19 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     );
     let p = pos[in_vertex_index];
     out.clip_position = vec4<f32>(p, 0.0, 1.0);
-    // NDC (-1, 1) -> (0, 0) top-left; NDC (1, -1) -> (1, 1) bottom-right
-    out.tex_coords = vec2<f32>((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+    let u = (p.x + 1.0) * 0.5;
+    let v = (1.0 - p.y) * 0.5;
+    if (params.turns == 1u) {
+        out.tex_coords = vec2<f32>(v, 1.0 - u);
+    } else if (params.turns == 2u) {
+        out.tex_coords = vec2<f32>(1.0 - u, 1.0 - v);
+    } else if (params.turns == 3u) {
+        out.tex_coords = vec2<f32>(1.0 - v, u);
+    } else {
+        out.tex_coords = vec2<f32>(u, v);
+    }
     return out;
 }
-
-@group(0) @binding(0)
-var t_diffuse: texture_2d<f32>;
-@group(0) @binding(1)
-var s_diffuse: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -461,20 +475,98 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const SHADER_YUV: &str = r#"
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+};
+
+struct FrameParams {
+    turns: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var t_y: texture_2d<f32>;
+@group(0) @binding(1) var t_u: texture_2d<f32>;
+@group(0) @binding(2) var t_v: texture_2d<f32>;
+@group(0) @binding(3) var s_sampler: sampler;
+@group(0) @binding(4) var<uniform> params: FrameParams;
+
+@vertex
+fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+    var out: VertexOutput;
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0)
+    );
+    let p = pos[in_vertex_index];
+    out.clip_position = vec4<f32>(p, 0.0, 1.0);
+    let u = (p.x + 1.0) * 0.5;
+    let v = (1.0 - p.y) * 0.5;
+    if (params.turns == 1u) {
+        out.tex_coords = vec2<f32>(v, 1.0 - u);
+    } else if (params.turns == 2u) {
+        out.tex_coords = vec2<f32>(1.0 - u, 1.0 - v);
+    } else if (params.turns == 3u) {
+        out.tex_coords = vec2<f32>(1.0 - v, u);
+    } else {
+        out.tex_coords = vec2<f32>(u, v);
+    }
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let y = textureSample(t_y, s_sampler, in.tex_coords).r;
+    let u = textureSample(t_u, s_sampler, in.tex_coords).r;
+    let v = textureSample(t_v, s_sampler, in.tex_coords).r;
+
+    // ITU-R BT.601 studio-swing color conversion (matching OpenH264 / iOS VideoToolbox)
+    let y_val = 1.16438356 * (y - 0.0627451);
+    let r = clamp(y_val + 1.5960268 * (v - 0.5019608), 0.0, 1.0);
+    let g = clamp(y_val - 0.3917623 * (u - 0.5019608) - 0.6980010 * (v - 0.5019608), 0.0, 1.0);
+    let b = clamp(y_val + 2.0172321 * (u - 0.5019608), 0.0, 1.0);
+
+    return vec4<f32>(r, g, b, 1.0);
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+struct FrameParams {
+    turns: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+unsafe impl bytemuck::Pod for FrameParams {}
+unsafe impl bytemuck::Zeroable for FrameParams {}
+
 struct WgpuRenderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     texture_format: wgpu::TextureFormat,
-    render_pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline_rgba: wgpu::RenderPipeline,
+    pipeline_yuv: wgpu::RenderPipeline,
+    bind_group_layout_rgba: wgpu::BindGroupLayout,
+    bind_group_layout_yuv: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 
-    // Mirror frame texture
-    texture: Option<wgpu::Texture>,
-    texture_view: Option<wgpu::TextureView>,
-    bind_group: Option<wgpu::BindGroup>,
+    mirror_params_buf: wgpu::Buffer,
+    sidebar_params_buf: wgpu::Buffer,
+
+    // Mirror frame textures & bind group
+    texture_rgba: Option<wgpu::Texture>,
+    texture_y: Option<wgpu::Texture>,
+    texture_u: Option<wgpu::Texture>,
+    texture_v: Option<wgpu::Texture>,
+    mirror_bind_group: Option<wgpu::BindGroup>,
+    is_yuv: bool,
     texture_size: (u32, u32),
 
     // Sidebar button strip texture
@@ -564,13 +656,17 @@ impl WgpuRenderer {
         };
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Fullscreen Quad Shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
+        let shader_rgba = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fullscreen Quad Shader RGBA"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_RGBA.into()),
+        });
+        let shader_yuv = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fullscreen Quad Shader YUV"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_YUV.into()),
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Texture Bind Group Layout"),
+        let bind_group_layout_rgba = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Texture Bind Group Layout RGBA"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -588,26 +684,93 @@ impl WgpuRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+        let bind_group_layout_yuv = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Texture Bind Group Layout YUV"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout_rgba = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout RGBA"),
+            bind_group_layouts: &[&bind_group_layout_rgba],
+            push_constant_ranges: &[],
+        });
+        let pipeline_layout_yuv = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout YUV"),
+            bind_group_layouts: &[&bind_group_layout_yuv],
             push_constant_ranges: &[],
         });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&pipeline_layout),
+        let pipeline_rgba = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline RGBA"),
+            layout: Some(&pipeline_layout_rgba),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &shader_rgba,
                 entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &shader_rgba,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
@@ -626,11 +789,41 @@ impl WgpuRenderer {
                 conservative: false,
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let pipeline_yuv = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline YUV"),
+            layout: Some(&pipeline_layout_yuv),
+            vertex: wgpu::VertexState {
+                module: &shader_yuv,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
             },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader_yuv,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
         });
@@ -646,18 +839,41 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
+        let mirror_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Mirror FrameParams Uniform Buffer"),
+            size: std::mem::size_of::<FrameParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sidebar_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sidebar FrameParams Uniform Buffer"),
+            size: std::mem::size_of::<FrameParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        queue.write_buffer(&mirror_params_buf, 0, bytemuck::bytes_of(&FrameParams::default()));
+        queue.write_buffer(&sidebar_params_buf, 0, bytemuck::bytes_of(&FrameParams::default()));
+
         let mut renderer = Self {
             surface,
             device,
             queue,
             config,
             texture_format,
-            render_pipeline,
-            bind_group_layout,
+            pipeline_rgba,
+            pipeline_yuv,
+            bind_group_layout_rgba,
+            bind_group_layout_yuv,
             sampler,
-            texture: None,
-            texture_view: None,
-            bind_group: None,
+            mirror_params_buf,
+            sidebar_params_buf,
+            texture_rgba: None,
+            texture_y: None,
+            texture_u: None,
+            texture_v: None,
+            mirror_bind_group: None,
+            is_yuv: false,
             texture_size: (0, 0),
             sidebar_texture: None,
             sidebar_texture_view: None,
@@ -681,63 +897,209 @@ impl WgpuRenderer {
     fn update_texture(&mut self, frame: &DecodedFrame) {
         let width = frame.width as u32;
         let height = frame.height as u32;
+        let turns = crate::video::upright_turns(frame.orientation) as u32;
 
-        if self.texture_size != (width, height) || self.texture.is_none() {
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Mirror Frame Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.texture_format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Mirror Frame Bind Group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-            self.texture = Some(texture);
-            self.texture_view = Some(view);
-            self.bind_group = Some(bind_group);
-            self.texture_size = (width, height);
-        }
+        let params = FrameParams {
+            turns,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        self.queue.write_buffer(&self.mirror_params_buf, 0, bytemuck::bytes_of(&params));
 
-        if let Some(texture) = &self.texture {
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                bytemuck::cast_slice(&frame.buf),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+        match &frame.data {
+            crate::video::FrameData::Yuv420 { y, u, v, y_stride, u_stride, v_stride } => {
+                let uv_w = (width + 1) / 2;
+                let uv_h = (height + 1) / 2;
+                self.is_yuv = true;
+
+                if self.texture_size != (width, height)
+                    || self.texture_y.is_none()
+                    || self.texture_u.is_none()
+                    || self.texture_v.is_none()
+                {
+                    let tex_desc = |label: &'static str, w: u32, h: u32| {
+                        self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some(label),
+                            size: wgpu::Extent3d {
+                                width: w,
+                                height: h,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::R8Unorm,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        })
+                    };
+
+                    let tex_y = tex_desc("Y Texture", width, height);
+                    let tex_u = tex_desc("U Texture", uv_w, uv_h);
+                    let tex_v = tex_desc("V Texture", uv_w, uv_h);
+
+                    let view_y = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
+                    let view_u = tex_u.create_view(&wgpu::TextureViewDescriptor::default());
+                    let view_v = tex_v.create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Mirror Frame YUV Bind Group"),
+                        layout: &self.bind_group_layout_yuv,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&view_y),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&view_u),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&view_v),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: self.mirror_params_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                    self.texture_y = Some(tex_y);
+                    self.texture_u = Some(tex_u);
+                    self.texture_v = Some(tex_v);
+                    self.mirror_bind_group = Some(bind_group);
+                    self.texture_size = (width, height);
+                }
+
+                if let (Some(ty), Some(tu), Some(tv)) = (&self.texture_y, &self.texture_u, &self.texture_v) {
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: ty,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        y,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(*y_stride as u32),
+                            rows_per_image: Some(height),
+                        },
+                        wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: tu,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        u,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(*u_stride as u32),
+                            rows_per_image: Some(uv_h),
+                        },
+                        wgpu::Extent3d {
+                            width: uv_w,
+                            height: uv_h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: tv,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        v,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(*v_stride as u32),
+                            rows_per_image: Some(uv_h),
+                        },
+                        wgpu::Extent3d {
+                            width: uv_w,
+                            height: uv_h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+            }
+            crate::video::FrameData::Rgba(buf) => {
+                self.is_yuv = false;
+                if self.texture_size != (width, height) || self.texture_rgba.is_none() {
+                    let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Mirror Frame RGBA Texture"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self.texture_format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Mirror Frame RGBA Bind Group"),
+                        layout: &self.bind_group_layout_rgba,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.mirror_params_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    self.texture_rgba = Some(texture);
+                    self.mirror_bind_group = Some(bind_group);
+                    self.texture_size = (width, height);
+                }
+
+                if let Some(texture) = &self.texture_rgba {
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        bytemuck::cast_slice(buf),
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(4 * width),
+                            rows_per_image: Some(height),
+                        },
+                        wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -773,7 +1135,7 @@ impl WgpuRenderer {
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Sidebar Bind Group"),
-                layout: &self.bind_group_layout,
+                layout: &self.bind_group_layout_rgba,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -782,6 +1144,10 @@ impl WgpuRenderer {
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.sidebar_params_buf.as_entire_binding(),
                     },
                 ],
             });
@@ -814,7 +1180,7 @@ impl WgpuRenderer {
         }
     }
 
-    fn render(&mut self, scale_factor: f32) -> Result<(), wgpu::SurfaceError> {
+    fn render(&mut self, scale_factor: f32, current_frame: &DecodedFrame) -> Result<(), wgpu::SurfaceError> {
         if self.config.width == 0 || self.config.height == 0 {
             return Ok(());
         }
@@ -852,9 +1218,9 @@ impl WgpuRenderer {
             });
 
             // 1. Draw the mirror frame into its letterboxed area on the left
-            if let Some(bind_group) = &self.bind_group {
-                let fw = self.texture_size.0 as f32;
-                let fh = self.texture_size.1 as f32;
+            if let Some(bind_group) = &self.mirror_bind_group {
+                let fw = current_frame.display_width() as f32;
+                let fh = current_frame.display_height() as f32;
 
                 if fw > 0.0 && fh > 0.0 {
                     let img_aspect = fw / fh;
@@ -868,7 +1234,11 @@ impl WgpuRenderer {
                         (content_w_px, h, 0.0, (gh - h) / 2.0)
                     };
 
-                    render_pass.set_pipeline(&self.render_pipeline);
+                    if self.is_yuv {
+                        render_pass.set_pipeline(&self.pipeline_yuv);
+                    } else {
+                        render_pass.set_pipeline(&self.pipeline_rgba);
+                    }
                     render_pass.set_viewport(x_off, y_off, img_w, img_h, 0.0, 1.0);
                     render_pass.set_bind_group(0, bind_group, &[]);
                     render_pass.draw(0..3, 0..1);
@@ -878,7 +1248,7 @@ impl WgpuRenderer {
             // 2. Draw the sidebar into its strip on the right
             if sidebar_w_px > 0.0 {
                 if let Some(sb_bind_group) = &self.sidebar_bind_group {
-                    render_pass.set_pipeline(&self.render_pipeline);
+                    render_pass.set_pipeline(&self.pipeline_rgba);
                     render_pass.set_viewport(content_w_px, 0.0, sidebar_w_px, gh, 0.0, 1.0);
                     render_pass.set_bind_group(0, sb_bind_group, &[]);
                     render_pass.draw(0..3, 0..1);
@@ -1197,8 +1567,8 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let (win_w, win_h) = scaled_fit(
-            self.current_frame.width,
-            self.current_frame.height,
+            self.current_frame.display_width(),
+            self.current_frame.display_height(),
             self.display_scale,
             sidebar::WIDTH,
         );
@@ -1304,7 +1674,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Check for device orientation change and request window resize
-                let cur_dims = (self.current_frame.width, self.current_frame.height);
+                let cur_dims = (
+                    self.current_frame.display_width(),
+                    self.current_frame.display_height(),
+                );
                 if cur_dims != self.last_dims {
                     self.last_dims = cur_dims;
                     let (nw, nh) =
@@ -1353,7 +1726,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let scale_factor = self.scale_factor();
                 if let Some(renderer) = &mut self.renderer {
-                    match renderer.render(scale_factor) {
+                    match renderer.render(scale_factor, &self.current_frame) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             if let Some(w) = &self.window {
@@ -1379,8 +1752,8 @@ impl ApplicationHandler<UserEvent> for App {
                         let content_w_px = (renderer.config.width as f32 - sidebar_w_px).max(1.0);
                         let gh = renderer.config.height as f32;
 
-                        let fw = self.current_frame.width;
-                        let fh = self.current_frame.height;
+                        let fw = self.current_frame.display_width();
+                        let fh = self.current_frame.display_height();
                         if fw > 0 && fh > 0 {
                             let (nx, ny) = map_to_norm(
                                 self.cursor_pos.0,
@@ -1443,8 +1816,8 @@ impl ApplicationHandler<UserEvent> for App {
                             }
 
                             // Touch event on mirror screen
-                            let fw = self.current_frame.width as f32;
-                            let fh = self.current_frame.height as f32;
+                            let fw = self.current_frame.display_width() as f32;
+                            let fh = self.current_frame.display_height() as f32;
                             if fw > 0.0 && fh > 0.0 {
                                 let img_aspect = fw / fh;
                                 let area_aspect = content_w_px / gh;
@@ -1466,8 +1839,8 @@ impl ApplicationHandler<UserEvent> for App {
                                         my,
                                         content_w_px as usize,
                                         gh as usize,
-                                        self.current_frame.width,
-                                        self.current_frame.height,
+                                        self.current_frame.display_width(),
+                                        self.current_frame.display_height(),
                                     );
                                     send_touch(&self.input_tx, TouchPhase::Down, nx, ny);
                                     self.input_state.touching = true;
@@ -1589,8 +1962,8 @@ pub fn run_window(
 
     let (sw, sh) = screen_visible_size();
     let (sw, sh) = (sw as f32, sh as f32);
-    let long = first.width.max(first.height).max(1) as f32;
-    let short = first.width.min(first.height).max(1) as f32;
+    let long = first.display_width().max(first.display_height()).max(1) as f32;
+    let short = first.display_width().min(first.display_height()).max(1) as f32;
     let display_scale = ((sh * 0.92) / long).min((sw * 0.92) / short);
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -1669,11 +2042,7 @@ mod tests {
             Arc::new(Mutex::new(ClipState::default())),
             Arc::new(AtomicBool::new(false)),
             1.0,
-            DecodedFrame {
-                width: 100,
-                height: 100,
-                buf: vec![0; 100 * 100],
-            },
+            DecodedFrame::new_rgba(vec![0; 100 * 100], 100, 100, 1),
         );
         (app, rx)
     }

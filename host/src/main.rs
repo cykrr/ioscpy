@@ -213,6 +213,23 @@ fn run_connection_loop(
         };
 
         stream.set_nodelay(true).ok();
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Cap TCP receive buffer to 512KB. Linux auto-tuning can expand this
+            // up to 6MB, which buffers 3-5 seconds of video frames if there is
+            // any transient slowdown, causing huge persistent latency drift.
+            let buf_size: libc::c_int = 512 * 1024;
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                );
+            }
+        }
         // Time-bound the handshake so a daemon that accepts but never answers
         // errors out instead of hanging. The session loop drops the read timeout after.
         stream.set_read_timeout(Some(Duration::from_secs(8))).ok();
@@ -481,16 +498,18 @@ fn cmd_bench(cli: &Cli, port: u16, secs: u64) -> Result<()> {
                         h264_dec = h264::H264Decoder::new();
                     }
                     if let Some(d) = h264_dec.as_mut() {
+                        let orientation = protocol::video_orientation(flags);
                         let dt = Instant::now();
-                        if let h264::Decoded::Frame(f) = d.decode(data) {
+                        if let h264::Decoded::Frame(f) = d.decode(data, orientation) {
                             decode_samples.push(dt.elapsed().as_secs_f64() * 1000.0);
                             decoded += 1;
                             (w, h) = (f.width as u32, f.height as u32);
                         }
                     }
                 } else {
+                    let orientation = protocol::video_orientation(flags);
                     let dt = Instant::now();
-                    if video::decode_jpeg(data).is_some() {
+                    if video::decode_jpeg(data, orientation).is_some() {
                         decode_samples.push(dt.elapsed().as_secs_f64() * 1000.0);
                         decoded += 1;
                     }

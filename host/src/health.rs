@@ -2,6 +2,8 @@
 //! that keeps the control channel alive and surfaces what the daemon sends.
 
 use std::net::{Shutdown, TcpStream};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -17,6 +19,24 @@ use crate::protocol::{self, Capabilities, HelloAck, LogMessage, MessageType, CHA
 use crate::record::Recorder;
 use crate::video;
 use crate::window::FrameSlot;
+
+/// Query the number of unread bytes in the OS socket receive buffer.
+/// Returns 0 on error or on non-Unix platforms.
+#[cfg(unix)]
+fn pending_socket_bytes(stream: &TcpStream) -> usize {
+    let mut bytes: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut bytes) };
+    if rc == 0 && bytes > 0 {
+        bytes as usize
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn pending_socket_bytes(_stream: &TcpStream) -> usize {
+    0
+}
 
 /// Print the capability map in a readable block. Shown after handshake and under
 /// `--debug`.
@@ -144,11 +164,12 @@ pub fn run_session(
                                 }
                             }
                             if let Some(slot) = &sink {
+                                let orientation = protocol::video_orientation(flags);
                                 let decoded = if flags & protocol::VIDEO_FLAG_H264 != 0 {
                                     if h264.is_none() {
                                         h264 = H264Decoder::new();
                                     }
-                                    match h264.as_mut().map(|d| d.decode(data)) {
+                                    match h264.as_mut().map(|d| d.decode(data, orientation)) {
                                         Some(Decoded::Frame(f)) => Some(f),
                                         Some(Decoded::Failed) | None => {
                                             // Lost sync (or no decoder), ask for a
@@ -161,13 +182,9 @@ pub fn run_session(
                                 } else {
                                     // JPEG: latest-only, decoded here so the window
                                     // just blits.
-                                    video::decode_jpeg(data)
+                                    video::decode_jpeg(data, orientation)
                                 };
                                 if let Some(f) = decoded {
-                                    // Capture is always portrait, so rotate it
-                                    let turns =
-                                        video::upright_turns(protocol::video_orientation(flags));
-                                    let f = video::rotate_cw(f, turns);
                                     let mut lock = slot.lock().unwrap();
                                     if lock.frame.is_some() {
                                         lock.dropped += 1;
@@ -178,6 +195,12 @@ pub fn run_session(
                                         waker();
                                     }
                                 }
+                            }
+                            // If socket receive buffer is building up backlog
+                            // (> 150KB, i.e. several frames behind real-time), signal
+                            // for a fresh keyframe so the stream re-synchronizes quickly.
+                            if pending_socket_bytes(&reader) > 150_000 {
+                                reader_keyframe.store(true, Ordering::Relaxed);
                             }
                         }
                         reader_count.fetch_add(1, Ordering::Relaxed);

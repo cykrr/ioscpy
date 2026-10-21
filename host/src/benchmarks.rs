@@ -53,6 +53,88 @@ mod tests {
     }
 
     #[test]
+    fn bench_rgba_vs_rgb_pack() {
+        use openh264::decoder::Decoder;
+        use openh264::encoder::Encoder;
+        use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
+
+        let w = 1170;
+        let h = 2532;
+        let mut encoder = Encoder::new().unwrap();
+        let mut decoder = Decoder::new().unwrap();
+
+        let mut rgb = vec![128u8; w * h * 3];
+        for i in 0..w * h {
+            rgb[i * 3] = (i % 256) as u8;
+            rgb[i * 3 + 1] = ((i * 3) % 256) as u8;
+            rgb[i * 3 + 2] = ((i * 7) % 256) as u8;
+        }
+
+        let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (w, h)));
+        let stream = encoder.encode(&yuv).unwrap();
+        let stream_bytes = stream.to_vec();
+
+        // Warm up and decode
+        let mut decoder2 = Decoder::new().unwrap();
+        let iters = 20;
+
+        // 0. Time decoder.decode alone
+        let start0 = Instant::now();
+        for _ in 0..iters {
+            let _ = decoder2.decode(&stream_bytes);
+        }
+        let elapsed0 = start0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        let yuv_decoded = decoder.decode(&stream_bytes).unwrap().unwrap();
+
+        // 1. Old way: write_rgb8 + pack_rgb888 + rotate_cw
+        let start1 = Instant::now();
+        let mut rgb_buf = vec![0u8; w * h * 3];
+        for _ in 0..iters {
+            yuv_decoded.write_rgb8(&mut rgb_buf);
+            let frame = crate::video::DecodedFrame::new_rgba(
+                crate::video::pack_rgb888(&rgb_buf, w, h),
+                w,
+                h,
+                1,
+            );
+            let _ = crate::video::rotate_cw(frame, 1);
+        }
+        let elapsed1 = start1.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // 2. New GPU path: zero-copy YUV extraction (conversion + rotation done on GPU)
+        let start2 = Instant::now();
+        let (y_stride, u_stride, v_stride) = yuv_decoded.strides();
+        let mut y_plane = vec![0u8; y_stride * h];
+        let mut u_plane = vec![0u8; u_stride * ((h + 1) / 2)];
+        let mut v_plane = vec![0u8; v_stride * ((h + 1) / 2)];
+        for _ in 0..iters {
+            y_plane.copy_from_slice(yuv_decoded.y());
+            u_plane.copy_from_slice(yuv_decoded.u());
+            v_plane.copy_from_slice(yuv_decoded.v());
+            let _frame = crate::video::DecodedFrame::new_yuv420(
+                y_plane.clone(),
+                u_plane.clone(),
+                v_plane.clone(),
+                y_stride,
+                u_stride,
+                v_stride,
+                w,
+                h,
+                1,
+            );
+        }
+        let elapsed2 = start2.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        println!("\n=== Benchmark: Color Conversion & Rotation (1170x2532) ===");
+        println!("  Decode alone:                                   {:.2} ms ({:.1} FPS)", elapsed0, 1000.0 / elapsed0);
+        println!("  Old way (write_rgb8 + pack_rgb888 + rotate_cw): {:.2} ms ({:.1} FPS)", elapsed1, 1000.0 / elapsed1);
+        println!("  New GPU path (zero-copy YUV extraction):        {:.2} ms ({:.1} FPS)", elapsed2, 1000.0 / elapsed2);
+        println!("  Speedup: {:.2}x faster", elapsed1 / elapsed2);
+        println!("===========================================================");
+    }
+
+    #[test]
     fn bench_wire_frame_roundtrip() {
         let payload = vec![0xAB; 16384]; // 16 KB frame
         let iterations = 20_000;

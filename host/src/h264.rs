@@ -55,7 +55,7 @@ impl H264Decoder {
     }
 
     /// Decode one AVCC frame (4-byte length-prefixed NALs, may carry SPS/PPS).
-    pub fn decode(&mut self, avcc: &[u8]) -> Decoded {
+    pub fn decode(&mut self, avcc: &[u8], orientation: u8) -> Decoded {
         let mut out_ptr: *const u8 = std::ptr::null();
         let mut w: i32 = 0;
         let mut h: i32 = 0;
@@ -73,17 +73,9 @@ impl H264Decoder {
             1 if !out_ptr.is_null() && w > 0 && h > 0 => {
                 let width = w as usize;
                 let height = h as usize;
-                // the shim owns this buffer until the next decode, so copy it
-                // into a frame we own before returning
-                let bgra = unsafe { std::slice::from_raw_parts(out_ptr, width * height * 4) };
-                let mut buf = vec![0u32; width * height];
-                for (i, px) in buf.iter_mut().enumerate() {
-                    let b = bgra[i * 4] as u32;
-                    let g = bgra[i * 4 + 1] as u32;
-                    let r = bgra[i * 4 + 2] as u32;
-                    *px = (r << 16) | (g << 8) | b;
-                }
-                Decoded::Frame(DecodedFrame { buf, width, height })
+                let bgra = unsafe { std::slice::from_raw_parts(out_ptr as *const u32, width * height) };
+                let buf = bgra.to_vec();
+                Decoded::Frame(DecodedFrame::new_rgba(buf, width, height, orientation))
             }
             0 => Decoded::Pending,
             _ => Decoded::Failed,
@@ -104,10 +96,11 @@ use openh264::{decoder::Decoder, formats::YUVSource};
 #[cfg(not(target_os = "macos"))]
 pub struct H264Decoder {
     inner: Decoder,
-    // Reused between frames so the per-frame conversion is a copy, not an
-    // allocation.
+    // Reused between frames so the per-frame conversion is zero-allocation.
     annex_b: Vec<u8>,
-    rgb: Vec<u8>,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -139,24 +132,50 @@ impl H264Decoder {
         Decoder::new().ok().map(|inner| Self {
             inner,
             annex_b: Vec::new(),
-            rgb: Vec::new(),
+            y: Vec::new(),
+            u: Vec::new(),
+            v: Vec::new(),
         })
     }
 
-    pub fn decode(&mut self, avcc: &[u8]) -> Decoded {
+    pub fn decode(&mut self, avcc: &[u8], orientation: u8) -> Decoded {
         if !avcc_to_annex_b(avcc, &mut self.annex_b) {
             return Decoded::Failed;
         }
         match self.inner.decode(&self.annex_b) {
             Ok(Some(yuv)) => {
                 let (width, height) = yuv.dimensions();
-                let needed = width * height * 3;
-                if self.rgb.len() < needed {
-                    self.rgb.resize(needed, 0);
+                let (y_stride, u_stride, v_stride) = yuv.strides();
+
+                let y_needed = y_stride * height;
+                let u_needed = u_stride * ((height + 1) / 2);
+                let v_needed = v_stride * ((height + 1) / 2);
+
+                if self.y.len() != y_needed {
+                    self.y.resize(y_needed, 0);
                 }
-                yuv.write_rgb8(&mut self.rgb[..needed]);
-                let buf = crate::video::pack_rgb888(&self.rgb, width, height);
-                Decoded::Frame(DecodedFrame { buf, width, height })
+                if self.u.len() != u_needed {
+                    self.u.resize(u_needed, 0);
+                }
+                if self.v.len() != v_needed {
+                    self.v.resize(v_needed, 0);
+                }
+
+                self.y.copy_from_slice(yuv.y());
+                self.u.copy_from_slice(yuv.u());
+                self.v.copy_from_slice(yuv.v());
+
+                Decoded::Frame(DecodedFrame::new_yuv420(
+                    self.y.clone(),
+                    self.u.clone(),
+                    self.v.clone(),
+                    y_stride,
+                    u_stride,
+                    v_stride,
+                    width,
+                    height,
+                    orientation,
+                ))
             }
             Ok(None) => Decoded::Pending,
             Err(e) => {

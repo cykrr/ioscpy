@@ -832,6 +832,7 @@ dependencies = [
  "cocoa",
  "ctrlc",
  "getrandom",
+ "libc",
  "mp4",
  "objc",
  "openh264",

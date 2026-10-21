@@ -1,13 +1,91 @@
-//! Video decode. Turns a JPEG frame into a packed 0RGB buffer the window can
-//! blit directly. The H.264 path produces the same `DecodedFrame` type.
+//! Video decode. Turns a JPEG or H.264 frame into a DecodedFrame ready for
+//! rendering. Planar YUV 4:2:0 is preserved for direct GPU shader conversion,
+//! bypassing slow CPU color packing and rotation.
 
 use zune_jpeg::JpegDecoder;
 
-/// A decoded frame: a `width * height` buffer of `0x00RRGGBB` pixels.
+/// Underlying pixel buffer payload of a decoded video frame.
+#[derive(Clone)]
+pub enum FrameData {
+    /// 32-bit packed BGRA/RGBA pixels (0x00RRGGBB). Used for JPEG and macOS VideoToolbox.
+    Rgba(Vec<u32>),
+    /// Planar YUV 4:2:0. Used for Linux/Windows OpenH264 decoder with zero CPU conversion.
+    Yuv420 {
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+        y_stride: usize,
+        u_stride: usize,
+        v_stride: usize,
+    },
+}
+
+/// A decoded frame carrying image data, native capture dimensions, and orientation.
+#[derive(Clone)]
 pub struct DecodedFrame {
-    pub buf: Vec<u32>,
+    pub data: FrameData,
     pub width: usize,
     pub height: usize,
+    pub orientation: u8,
+}
+
+impl DecodedFrame {
+    pub fn new_rgba(buf: Vec<u32>, width: usize, height: usize, orientation: u8) -> Self {
+        Self {
+            data: FrameData::Rgba(buf),
+            width,
+            height,
+            orientation,
+        }
+    }
+
+    pub fn new_yuv420(
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+        y_stride: usize,
+        u_stride: usize,
+        v_stride: usize,
+        width: usize,
+        height: usize,
+        orientation: u8,
+    ) -> Self {
+        Self {
+            data: FrameData::Yuv420 {
+                y,
+                u,
+                v,
+                y_stride,
+                u_stride,
+                v_stride,
+            },
+            width,
+            height,
+            orientation,
+        }
+    }
+
+    /// Display width after accounting for upright orientation turns.
+    #[inline]
+    pub fn display_width(&self) -> usize {
+        let turns = upright_turns(self.orientation);
+        if turns & 1 == 1 {
+            self.height
+        } else {
+            self.width
+        }
+    }
+
+    /// Display height after accounting for upright orientation turns.
+    #[inline]
+    pub fn display_height(&self) -> usize {
+        let turns = upright_turns(self.orientation);
+        if turns & 1 == 1 {
+            self.width
+        } else {
+            self.height
+        }
+    }
 }
 
 /// Clockwise quarter-turns needed to show a captured orientation upright
@@ -22,55 +100,23 @@ pub fn upright_turns(orientation: u8) -> u8 {
     }
 }
 
-/// Rotate a decoded frame `turns` clockwise quarter-turns (0..=3). 0 is a no-op,
-/// so the portrait path costs nothing.
-pub fn rotate_cw(frame: DecodedFrame, turns: u8) -> DecodedFrame {
-    let (w, h) = (frame.width, frame.height);
-    match turns & 3 {
-        0 => frame,
-        2 => {
-            // 180°: reversing the row-major buffer maps (r,c) -> (H-1-r, W-1-c).
-            let mut buf = frame.buf;
-            buf.reverse();
-            DecodedFrame {
-                buf,
-                width: w,
-                height: h,
-            }
-        }
-        1 => {
-            // 90° CW: src(c,r) -> dst(col = H-1-r, row = c); dst is H×W.
-            let (dw, dh) = (h, w);
-            let mut buf = vec![0u32; dw * dh];
-            for r in 0..h {
-                let src_row = r * w;
-                for c in 0..w {
-                    buf[c * dw + (h - 1 - r)] = frame.buf[src_row + c];
-                }
-            }
-            DecodedFrame {
-                buf,
-                width: dw,
-                height: dh,
-            }
-        }
-        _ => {
-            // 270° CW (== 90° CCW): src(c,r) -> dst(col = r, row = W-1-c).
-            let (dw, dh) = (h, w);
-            let mut buf = vec![0u32; dw * dh];
-            for r in 0..h {
-                let src_row = r * w;
-                for c in 0..w {
-                    buf[(w - 1 - c) * dw + r] = frame.buf[src_row + c];
-                }
-            }
-            DecodedFrame {
-                buf,
-                width: dw,
-                height: dh,
-            }
-        }
+/// Rotate a decoded frame `turns` clockwise quarter-turns (0..=3). 0 is a no-op.
+/// In the modern GPU pipeline rotation is performed in the vertex shader, so this
+/// simply adjusts the orientation metadata in O(1) time without copying memory.
+#[allow(dead_code)]
+pub fn rotate_cw(mut frame: DecodedFrame, turns: u8) -> DecodedFrame {
+    if (turns & 3) == 0 {
+        return frame;
     }
+    let cur_turns = upright_turns(frame.orientation);
+    let new_turns = (cur_turns + (turns & 3)) & 3;
+    frame.orientation = match new_turns {
+        1 => 3, // landscape left (turns 1)
+        2 => 2, // upside down (turns 2)
+        3 => 4, // landscape right (turns 3)
+        _ => 1, // portrait (turns 0)
+    };
+    frame
 }
 
 /// Pack a tightly-packed RGB888 buffer into the window's `0x00RRGGBB` layout.
@@ -88,7 +134,7 @@ pub fn pack_rgb888(rgb: &[u8], width: usize, height: usize) -> Vec<u32> {
 
 /// Decode a JPEG into a packed 0RGB buffer. Returns `None` on a bad frame.
 /// Color JPEGs decode to RGB by default, which is what the packing expects.
-pub fn decode_jpeg(jpeg: &[u8]) -> Option<DecodedFrame> {
+pub fn decode_jpeg(jpeg: &[u8], orientation: u8) -> Option<DecodedFrame> {
     let mut decoder = JpegDecoder::new(jpeg);
     let pixels = decoder.decode().ok()?;
     let (width, height) = decoder.dimensions()?;
@@ -98,5 +144,5 @@ pub fn decode_jpeg(jpeg: &[u8]) -> Option<DecodedFrame> {
     }
 
     let buf = pack_rgb888(&pixels, width, height);
-    Some(DecodedFrame { buf, width, height })
+    Some(DecodedFrame::new_rgba(buf, width, height, orientation))
 }
